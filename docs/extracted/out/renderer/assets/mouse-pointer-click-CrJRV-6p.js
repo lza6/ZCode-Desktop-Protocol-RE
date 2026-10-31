@@ -1,0 +1,1 @@
+import{n as e,t}from"./mouse-pointer-click-O4w7XT4L.js";export{e as __iconNode,t as default};

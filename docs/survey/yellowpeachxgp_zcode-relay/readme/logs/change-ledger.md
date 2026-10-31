@@ -1,0 +1,85 @@
+# zcode-relay 变更账本
+
+## 2026-08-22：建立组合仓库与工程契约
+
+- 操作：从 TriDefender/zcode-api 克隆核心，基线为 f6aa1471b858a2d6a3c1a2fcd77019d319b94613。
+- 操作：通过 Git subtree 纳入 liu5269/zcode2api 到 panel/zcode2api，来源为 925e929ccb9dddc6c9aa73b30d369090f1e59722。
+- 操作：添加 upstream-core、upstream-panel 和自有 origin 远程。
+- 决策：核心拥有账号池和运行状态，面板只通过内部控制 API 管理。
+- 约束：主线程完成全部工作，不使用 subagent。
+- 证据：git log --graph、git remote -v、git status --short --branch。
+- 未完成：故障转移、控制 API、面板适配和全量验证。
+
+## 2026-08-22：完成核心账号池最小状态机
+
+- 修改：新增 src/auth/pool-types.ts 和 src/auth/pool.ts。
+- 行为：按 provider round-robin，支持租约、最大并发、禁用、冷却、额度耗尽、认证失效和 challenge 状态。
+- 安全：账号快照只返回 credentialMasked，测试确认完整假凭据不会出现在 JSON。
+- 验证：bun test src/auth/pool.test.ts，4 pass、0 fail。
+- 未完成：AuthManager 接入、请求故障转移、控制 API、面板适配和全量验证。
+
+## 2026-08-22：AuthManager 接入账号租约
+
+- 修改：AuthManager 支持注入 AccountPool，并增加 acquireCredential。
+- 兼容：无账号池时保留原有单凭据 getCredential 行为；账号池模式要求显式使用租约。
+- 安全：控制面可获得账号池对象，但账号快照仍只返回脱敏凭据。
+- 验证：bun test src/auth/pool.test.ts src/auth/manager.test.ts，23 pass、0 fail；bun x tsc --noEmit，退出码 0。
+- 未完成：请求故障转移、控制 API、面板适配和全量验证。
+
+## 2026-08-22：接入代理请求级账号故障转移
+
+- 修改：新增 `src/proxy/failover.ts` 与 `src/proxy/failover.test.ts`；代理 handler 在每个上游尝试前按租约重建凭据、请求头和请求对象。
+- 行为：对 401、402、429、5xx 和网络异常按账号标记并切换；客户端 4xx 不切换；响应流完成或提前结束时释放租约。
+- 安全：调试与控制路径继续使用现有脱敏逻辑，不返回完整凭据。
+- 验证：`bun test src/proxy/failover.test.ts`，4 pass、0 fail；包含真实 `proxyRequest` 链路的 429→第二账号回归；`bun x tsc --noEmit` 退出码 0；`git diff --check` 通过。
+- 未完成：内部控制 API、面板适配、持久化、全量验证和推送。
+
+## 2026-08-22：完成核心控制 API 与加密账号持久化
+
+- 修改：新增 `src/server/internal-routes.ts`；接入独立控制密钥、账号增删改、启用/禁用、运行摘要、用量摘要、重复凭据幂等和脱敏响应。
+- 修改：新增 `src/auth/account-store.ts`，使用 AES-GCM 加密账号凭据，文件权限为 `0600`；核心启动时恢复账号池，管理变更后持久化。
+- 修改：`control.enabled`、`control.adminKey`、账号存储路径、冷却时间和并发策略进入配置；公开代理密钥与控制密钥禁止复用。
+- 验证：`bun test src/auth/account-store.test.ts src/server/internal-routes.test.ts src/server/server.test.ts src/config/loader.test.ts`，47 pass、0 fail；核心真实进程冒烟验证控制鉴权、创建、运行摘要和脱敏列表通过。
+- 未完成：面板核心客户端、Compose、核心全量验证和推送。
+
+## 2026-08-22：zcode2api 切换为核心控制面适配
+
+- 修改：新增 `panel/zcode2api/app/core_client.py`；核心模式下管理 API 和 `/v1/messages`、`/v1/models` 均经核心转发，核心不可用明确返回 503。
+- 安全：面板核心模式跳过本地账号额度轮询，不导出或导入本地凭据；核心账号凭据只在核心加密存储中保存。
+- 修改：新增 `docker-compose.zcode-relay.yml`、核心/面板健康检查和私有服务网络；Compose 使用环境变量注入密钥，不把密钥写入仓库。
+- 验证：面板核心客户端 `pytest`，4 pass、0 fail；`python3 -m compileall -q panel/zcode2api` 通过；临时环境变量下 `docker compose -f docker-compose.zcode-relay.yml config` 通过；核心定向回归 101 pass、0 fail；`bun x tsc --noEmit` 和 `git diff --check` 通过。
+- 验证补充：修正集成测试使用不存在的 `config.test.yaml`，改用仓库内 `config.example.yaml` 作为测试模板；补齐 Responses 路由账号池接入和 token usage 累计；`bun test` 全量为 526 pass、0 fail；真实核心进程再次验证无鉴权 `/health` 与控制 `/internal/runtime` 均 200；真实上游专用账号验证仍不执行。
+- 未完成：provider quota 周期刷新、独立控制 listener 和远程推送。
+
+## 2026-08-22：完成 quota monitor 与独立控制 listener
+
+- 修改：新增 `src/auth/quota.ts` 与 quota 回归测试；支持 provider endpoint、超时、健康/耗尽/error/unknown 状态和周期巡检。
+- 修改：核心 server 将控制 API 绑定到 `control.host/control.port` 独立 listener，公开 listener 隐藏 `/internal/*`；面板管理 URL 与公开流量 URL 分离。
+- 修改：Compose 使用 core `8080` 转发端口和 `8091` 控制端口，控制端口不发布到宿主机。
+- 验证：加入 quota 与独立 listener 后 `bun test` 为 530 pass、0 fail；`bun x tsc --noEmit`、面板 pytest/compileall、Compose config 均通过。
+- 状态：本轮开发目标已完成，剩余为 provider-specific 生产 endpoint 校验和 quota 报表/通知增强。
+
+## 2026-08-22：部署默认启用 quota 巡检
+
+- 修改：Compose 核心服务默认注入 `ZCODE_QUOTA_ENABLED=true`、60 秒周期和 10 秒超时；本地演示环境仍关闭巡检，避免无真实账号时产生外部请求。
+- 推送：提交 `8085cf5` 已推送到 `origin/master`。
+
+## 2026-08-22：修复核心模式 OAuth 登录断链
+
+- 根因：面板核心模式主动返回 409；面板 OAuth 仍使用已被上游移除的 `/oauth/cli/init` 与 `/oauth/cli/poll`；核心新 auth-code OAuth 没有控制面接入。
+- 修改：新增核心 `OAuthManager` 和 `/internal/oauth/start`、`/internal/oauth/callback/:id`、`/internal/oauth/status/:id`；面板增加无鉴权 provider callback relay，但实际状态和凭据只由核心处理。
+- 安全：access token、JWT、API Key 不出现在面板响应、浏览器回调页或日志中；成功只返回脱敏账号快照。
+- 验证：OAuth 客户端、OAuthManager、内部控制 API、面板客户端和 TypeScript 回归均通过；真实 provider 授权需用户在浏览器完成，未使用生产凭据代跑。
+
+## 2026-08-22：统一站点品牌为 zcode-relay
+
+- 修改：后台登录页、账号池页、设置页、导航、FastAPI 标题、服务 banner、CLI 展示、内置 WebUI 和模型列表归属标识统一为 `zcode-relay`。
+- 兼容：保留旧配置路径、环境变量、源码目录、上游来源、协议 clientInfo 和本地存储 key，避免已有部署与上游行为漂移。
+- 验证：完成全仓库用户可见标识检索；核心类型检查、面板编译和回归测试待本轮提交前执行。
+
+## 2026-08-22：阶段 1 验证报告与远程对账
+
+- 产物：新增 `readme/analysis/2026-08-22-phase1-verification.md`，记录范围、命令、结果、安全检查和已知边界。
+- 推送：功能提交 `3bdbb2c02204a48ea1cf97dcb62a7c96d60ae121` 已推送到 `origin/master`。
+- 对账：推送后 `git rev-parse HEAD` 与 `git ls-remote origin refs/heads/master` 均为 `3bdbb2c02204a48ea1cf97dcb62a7c96d60ae121`。
+- 说明：GitHub 对上游已有的 `Android-APP/.../libnode.so` 大文件给出建议警告；未改动该资产。

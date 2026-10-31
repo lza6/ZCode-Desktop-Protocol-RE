@@ -1,0 +1,2020 @@
+// Package workbuddy implements the Tencent CodeBuddy (workbuddy) channel:
+// OpenAI-variant chat completions with forced streaming, device-flow login,
+// credit balance queries with expiry buckets, daily checkin, growth tasks and
+// the panel's error taxonomy (6004 model-scoped limit, 402 credit exhaustion,
+// 12153 session death...).
+//
+// Endpoint behavior notes come from the clean-room research recorded in
+// research/2026-10-13-三项目与生态调研.md. No code was copied from the GPL
+// project; MIT reference code was re-implemented against the IR contract.
+package workbuddy
+
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"context"
+	crand "crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"bargainproxy/internal/config"
+	"bargainproxy/internal/driver"
+	"bargainproxy/internal/httpx"
+	"bargainproxy/internal/ir"
+	"bargainproxy/internal/model"
+	"bargainproxy/internal/prompt"
+	"bargainproxy/internal/uperr"
+	"regexp"
+	"strconv"
+)
+
+// Creds is the persisted credential shape for a workbuddy account.
+type Creds struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"` // unix seconds
+	UID          string `json:"uid,omitempty"`
+	Nickname     string `json:"nickname,omitempty"`
+	EnterpriseID string `json:"enterprise_id,omitempty"`
+	Realm        string `json:"realm,omitempty"`        // "cn" | "global"
+	DeviceToken  string `json:"device_token,omitempty"` // X-Device-Token when available
+	// APIKey marks an account signed in with a key minted on the build's own
+	// keys page (www.workbuddy.cn/profile/keys) instead of a browser/desktop
+	// OAuth session (BP-144, magpie workbuddy 0.1.37 / #407).
+	//
+	// A key is NOT a refreshable token: it goes out as both
+	// `X-API-Key: <key>` and `Authorization: Bearer <key>`, the account is
+	// personal with no domain and no enterprise, and there is nothing to
+	// renew. Treating one as OAuth made three things wrong at once — the
+	// upstream saw no X-API-Key, an X-Domain it never expects, and a 401
+	// triggered a refresh of a key that cannot be refreshed.
+	APIKey string `json:"api_key,omitempty"`
+}
+
+// IsAPIKey reports whether this account signs in with a key rather than an
+// OAuth session.
+func (c *Creds) IsAPIKey() bool { return c.APIKey != "" }
+
+// apiKeyUserID is the identity the official CLI presents for a key account:
+// "anonymous_" + the key's last 8 characters. Never a real uid.
+func apiKeyUserID(key string) string {
+	if len(key) <= 8 {
+		return "anonymous_" + key
+	}
+	return "anonymous_" + key[len(key)-8:]
+}
+
+// hasRemoteCatalogKey reports whether the key may ask /v3/config for the
+// model catalogue. The CLI's shouldLoadRemoteConfig only does that for ck_/pt_
+// keys; any other key keeps the built-in list, and asking would just 401.
+func hasRemoteCatalogKey(key string) bool {
+	return strings.HasPrefix(key, "ck_") || strings.HasPrefix(key, "pt_")
+}
+
+// RealmOrDefault normalizes the realm.
+func (c *Creds) RealmOrDefault() string {
+	if c.Realm == "global" {
+		return "global"
+	}
+	return "cn"
+}
+
+// business codes observed in upstream bodies.
+const (
+	codeModelRate   = 6004  // model-scoped rate limit, body carries reset wall-clock
+	codeModelQuota  = 6000  // quota refusal; the wording picks model-level vs account-level (misakano cdad965)
+	codeBadParams   = 11101 // invalid params: do not penalize the account
+	codeSessionDead = 12153 // session dead: needs re-login
+	codeQueueFull   = 6021  // inference cluster queue full ("queue.full.title"): upstream capacity event, NOT an account problem — rotating accounts at request pace miskilled a whole pool in seconds in the field (2026-10-15); the right response is wait, not switch
+	// codeQueueWaiting 6020 ("queue.waiting.title") is the same capacity event
+	// one step earlier in the queue (misakano 1e70717): same wait-don't-switch
+	// handling, no account penalty.
+	codeQueueWaiting = 6020
+	// codePromptTooLong: the prompt exceeds the model's context window. The
+	// same body fails on every account, so this is request-level: no rotation,
+	// no account penalty (2026-10-19).
+	codePromptTooLong = 11115
+	// codeAccountRestricted: upstream restricted the ACCOUNT ("request
+	// illegal" + displayMsg "账号存在异常行为，已被限制使用"). Refreshing cannot
+	// fix it; the account must leave routing. The same code also carries a
+	// model-level rate-limit message, which must stay soft_rate — so the
+	// wording decides, never the code alone (2026-10-20).
+	codeAccountRestricted = 11140
+	// codeChannelRefused: the channel check refused the caller's system
+	// prompt as an "unapproved channel". Request-level, not the account's
+	// fault; the driver retries once with the prompt moved into the user turn
+	// (BP-93).
+	codeChannelRefused = 11128
+)
+
+// Driver implements driver.Driver for the workbuddy channel.
+type Driver struct {
+	cfg  config.WorkBuddySettings
+	http *http.Client // streaming chat calls (no total timeout + header/idle watchdogs)
+	rpc  *http.Client // short billing / growth / refresh calls (total timeout)
+	// promptReplace is the hot-switchable system-prompt replacement (panel
+	// setting; default on). Off falls back to StripSystem like passthrough.
+	promptReplace atomic.Bool
+	// messagesAllowed gates the Anthropic-native /v1/messages lane (BP-131).
+	// Starts true; a 404/route refusal degrades it to false for the process,
+	// after which claude models ride the chat lane exactly as before.
+	messagesAllowed atomic.Bool
+	refreshMu       sync.Mutex
+	refreshes       map[string]*refreshFlight
+	// comma11128 caches the system-prompt keys whose opener line tripped the
+	// channel check AND whose comma rewrite cleared it (BP-227): later
+	// requests with the same system pre-apply the comma instead of paying a
+	// 400 + retry round trip every time (plugins 3968cdd7's commaSystems).
+	comma11128Mu sync.Mutex
+	comma11128   map[string]struct{}
+}
+
+// New builds the driver.
+func New(cfg config.WorkBuddySettings, httpClient *http.Client) *Driver {
+	if httpClient == nil {
+		httpClient = httpx.ChatClient()
+	}
+	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
+	d.promptReplace.Store(true)
+	d.messagesAllowed.Store(true)
+	return d
+}
+
+// SetPromptReplaceEnabled toggles system-prompt replacement at runtime.
+func (d *Driver) SetPromptReplaceEnabled(enabled bool) { d.promptReplace.Store(enabled) }
+
+// Channel implements driver.Driver.
+func (d *Driver) Channel() string { return model.ChannelWorkBuddy }
+
+// ParseCreds decodes a credential blob.
+func ParseCreds(raw []byte) (*Creds, error) {
+	var c Creds
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, fmt.Errorf("workbuddy: parse creds: %w", err)
+	}
+	return &c, nil
+}
+
+// LegacyAuth is the workbuddy2api-panel auths/workbuddy-*.json shape; import
+// accepts it for zero-friction migration of existing accounts.
+type LegacyAuth struct {
+	Account struct {
+		UID          string `json:"uid"`
+		Nickname     string `json:"nickname"`
+		EnterpriseID string `json:"enterpriseId"`
+	} `json:"account"`
+	Auth struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresAt    int64  `json:"expiresAt"`
+		Realm        string `json:"realm"`
+		DeviceToken  string `json:"device_token"`
+	} `json:"auth"`
+}
+
+// ParseLegacyAuth converts the panel's credential file into the canonical
+// Creds shape.
+func ParseLegacyAuth(raw []byte) (*Creds, error) {
+	var la LegacyAuth
+	if err := json.Unmarshal(raw, &la); err != nil {
+		return nil, fmt.Errorf("workbuddy: parse legacy auth: %w", err)
+	}
+	if la.Auth.AccessToken == "" {
+		return nil, fmt.Errorf("workbuddy: legacy auth missing accessToken")
+	}
+	return &Creds{
+		AccessToken:  la.Auth.AccessToken,
+		RefreshToken: la.Auth.RefreshToken,
+		ExpiresAt:    la.Auth.ExpiresAt,
+		UID:          la.Account.UID,
+		Nickname:     la.Account.Nickname,
+		EnterpriseID: la.Account.EnterpriseID,
+		Realm:        la.Auth.Realm,
+		DeviceToken:  la.Auth.DeviceToken,
+	}, nil
+}
+
+func (d *Driver) chatBase(c *Creds) string {
+	if c.RealmOrDefault() == "global" {
+		return strings.TrimRight(d.cfg.ChatBaseGL, "/")
+	}
+	return strings.TrimRight(d.cfg.ChatBaseCN, "/")
+}
+
+// chatCompletionsPath is the classic OpenAI-shaped lane.
+const chatCompletionsPath = "/v2/chat/completions"
+
+// Stream implements driver.Driver. Upstream is forced to stream:true; the
+// gateway aggregates for non-streaming clients.
+func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
+	creds, err := ParseCreds(call.Account.Credentials())
+	if err != nil {
+		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	if creds.AccessToken == "" {
+		return nil, uperr.New(uperr.ClassAuth, 401, "workbuddy: missing access token")
+	}
+
+	// BP-131: CN Claude models ride the Anthropic-native /v1/messages route,
+	// where the effort gears (max included) actually work. A missing route or
+	// a channel-check refusal degrades once, then permanently for the
+	// process; a genuine upstream error surfaces for the pool.
+	if claudeOnMessages(creds, call.UpstreamModel) && d.messagesAllowed.Load() {
+		resp2, ok, merr := d.tryMessages(ctx, call, creds)
+		if merr != nil {
+			return nil, merr
+		}
+		if ok {
+			streamBody := httpx.WatchIdle(resp2.Body, httpx.IdleTimeout())
+			defer streamBody.Close()
+			return d.parseMessagesSSE(ctx, streamBody, call, emit)
+		}
+	}
+
+	body, err := d.buildBody(call, creds, false)
+	if err != nil {
+		return nil, uperr.New(uperr.ClassBadRequest, 400, "workbuddy: build body: %v", err)
+	}
+	resp, err := d.postChat(ctx, creds, call, body, chatCompletionsPath)
+	if err != nil {
+		// 11128 "illegal API invocation from an unapproved channel" is the
+		// channel check refusing the caller's *system prompt* — not the
+		// account, and not something another account would accept. The edge
+		// only inspects system and assistant messages, so the same text
+		// passes once it arrives as the user's first turn (BP-93, following
+		// magpie-community/plugins workbuddy 0.1.29's field findings on both
+		// official builds).
+		if ue, ok := err.(*uperr.Error); ok && ue.Class == uperr.ClassBadRequest &&
+			strings.Contains(ue.Message, "11128") {
+			// BP-227: the edge matches the opener line WHOLE, so one comma
+			// between the agent name and its "powered by" phrase breaks the
+			// signature while the system prompt STAYS a system prompt
+			// (measured 400→200 against the live edge, plugins 79b02cc5) —
+			// lighter than moving it into the user turn. A verified comma
+			// system is remembered, so later requests pre-apply it. The
+			// systemAsUser move stays as the fallback for anything the comma
+			// does not clear (BP-93).
+			sysKey := systemKeyOfReq(call.Request)
+			// Only retry when the comma actually changes the wire: a body
+			// without the opener shape (replaced or stripped system, no
+			// assistant quote) would burn a round trip for nothing.
+			if jb, berr := d.buildBodyOpts(call, creds, bodyOpts{commaOpeners: true}); berr == nil && !bytes.Equal(jb, body) {
+				log.Printf("workbuddy: 11128 channel refusal; resending with the opener comma")
+				if r2, jerr := d.postChat(ctx, creds, call, jb, chatCompletionsPath); jerr == nil {
+					d.rememberCommaSystem(sysKey)
+					resp, err = r2, nil
+				}
+			}
+			if err != nil {
+				moved, berr := d.buildBody(call, creds, true)
+				if berr == nil {
+					log.Printf("workbuddy: 11128 channel refusal; resending with the system prompt as the user's instructions")
+					resp, err = d.postChat(ctx, creds, call, moved, chatCompletionsPath)
+				}
+			}
+		}
+		// BP-130: a 401 is worth one PROVEN retry. Upstream sometimes
+		// invalidates a still-fresh token (misakano #66: transient edge
+		// interception reads as 401; magpie workbuddy 0.1.31 renewed once and
+		// re-sent). A forced single-flight refresh either fixes the token —
+		// and this exact request succeeds — or confirms the account really is
+		// dead; without it every transient 401 cost a 10-minute pool rest for
+		// nothing.
+		if ue, ok := err.(*uperr.Error); ok && ue.Class == uperr.ClassAuth && ue.Status == 401 && !creds.IsAPIKey() {
+			if rerr := d.refresh(ctx, call.Account, true); rerr == nil {
+				if fresh, perr := ParseCreds(call.Account.Credentials()); perr == nil &&
+					fresh.AccessToken != "" && fresh.AccessToken != creds.AccessToken {
+					if body2, berr := d.buildBody(call, fresh, false); berr == nil {
+						log.Printf("workbuddy: 401; renewed credentials once and resending")
+						resp, err = d.postChat(ctx, fresh, call, body2, chatCompletionsPath)
+					}
+				}
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
+	defer streamBody.Close()
+	return d.parseStream(ctx, streamBody, call, emit)
+}
+
+// applyAuth sets the credential headers for either sign-in shape (BP-144).
+//
+// A key account (www.workbuddy.cn/profile/keys) presents the key twice —
+// `Authorization: Bearer <key>` and `X-API-Key: <key>` — exactly as
+// @tencent-ai/codebuddy-code does with CODEBUDDY_API_KEY. An OAuth account
+// presents only the bearer, and must never carry X-API-Key (the SDK's own
+// empty key header is what magpie's loader deletes).
+func applyAuth(req *http.Request, creds *Creds) {
+	if creds.IsAPIKey() {
+		req.Header.Set("Authorization", "Bearer "+creds.APIKey)
+		req.Header.Set("X-API-Key", creds.APIKey)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+}
+
+// postChat sends one chat request and returns the open response body on 200.
+// Any non-200 is classified into *uperr.Error.
+func (d *Driver) postChat(ctx context.Context, creds *Creds, call driver.ChatCall, body []byte, path string) (*http.Response, error) {
+	url := d.chatBase(creds) + path
+	// BP-178: the official client gzips model requests past 1KB
+	// (RequestBodyGzip in both builds' product.json, misakano 47f1ed61 /
+	// plugins f4d48ac — a long agent conversation went up 2.89GB plain).
+	// BestSpeed level, same threshold.
+	payload := body
+	if len(body) > wbGzipThreshold {
+		var buf bytes.Buffer
+		if zw, zerr := gzip.NewWriterLevel(&buf, gzip.BestSpeed); zerr == nil {
+			_, _ = zw.Write(body)
+			_ = zw.Close()
+			payload = buf.Bytes()
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if len(payload) != len(body) {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+	applyAuth(req, creds)
+	if creds.DeviceToken != "" {
+		req.Header.Set("X-Device-Token", creds.DeviceToken)
+	}
+	d.applyClientFingerprint(req, creds, call)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+	}
+	return resp, nil
+}
+
+// buildBody renders the upstream request. systemAsUser moves the caller's
+// system prompt into the first user turn inside <instructions> tags and puts
+// the upstream's own default system line first — the shape the channel check
+// accepts when it has refused the original (BP-93).
+func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool) ([]byte, error) {
+	return d.buildBodyOpts(call, creds, bodyOpts{systemAsUser: systemAsUser})
+}
+
+// bodyOpts carries the buildBody variants the retry paths need.
+type bodyOpts struct {
+	systemAsUser bool
+	commaOpeners bool // BP-227: set the opener comma regardless of the cache
+}
+
+func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts) ([]byte, error) {
+	req := call.Request
+	// Empty-name tool calls poison the session upstream-side (business error
+	// 11133): a stream that ends before the name fragment arrives yields
+	// name:"" entries, clients persist that history, and every resend is
+	// rejected. Drop such calls AND their paired tool results so the
+	// conversation self-heals (upstream fix 535e19e, symmetric pruning).
+	badIDs := map[string]bool{}
+	for _, m := range req.Messages {
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" && strings.TrimSpace(tc.Name) == "" {
+				badIDs[tc.ID] = true
+			}
+		}
+	}
+	// Rebuild the message array with prompt replacement applied.
+	messages := make([]map[string]any, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		if m.Role == ir.RoleTool && badIDs[m.ToolCallID] {
+			continue
+		}
+		wire := map[string]any{"role": string(m.Role)}
+		if m.Role == ir.RoleTool {
+			// OpenAI tool messages carry a plain string; image parts are not
+			// representable here and must not leak into the request (BP-70).
+			wire["content"] = ir.TextOf(m.Content)
+		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
+			wire["content"] = m.Content[0].Text
+		} else {
+			var parts []map[string]any
+			for _, p := range m.Content {
+				switch p.Kind {
+				case "text":
+					parts = append(parts, map[string]any{"type": "text", "text": p.Text})
+				case "image":
+					parts = append(parts, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + p.ImageMIME + ";base64," + p.ImageB64},
+					})
+				}
+			}
+			wire["content"] = parts
+		}
+		if len(m.ToolCalls) > 0 {
+			var tcs []map[string]any
+			for _, tc := range m.ToolCalls {
+				if badIDs[tc.ID] || strings.TrimSpace(tc.Name) == "" {
+					continue
+				}
+				tcs = append(tcs, map[string]any{
+					"id": tc.ID, "type": "function",
+					"function": map[string]any{"name": tc.Name, "arguments": tc.Arguments},
+				})
+			}
+			if len(tcs) > 0 {
+				wire["tool_calls"] = tcs
+			}
+		}
+		if m.ToolCallID != "" {
+			wire["tool_call_id"] = m.ToolCallID
+		}
+		if m.ToolName != "" {
+			wire["name"] = m.ToolName
+		}
+		// BP-159: an earlier assistant turn's thinking must ride the
+		// `reasoning` field — WorkBuddy's own client sets that one and skips
+		// its reasoning_content backfill, and the host silently drops
+		// reasoning_content (plugins wb 7f99447e). Never fold it into content
+		// as <think>: the official client does not send it that way.
+		if m.Role == ir.RoleAssistant && m.Reasoning != "" {
+			wire["reasoning"] = m.Reasoning
+		}
+		// An assistant message that carried only pruned tool calls and no
+		// content would serialize as {"role":"assistant"} — strictly-validated
+		// upstreams reject that. Drop the empty shell entirely.
+		if m.Role == ir.RoleAssistant && m.ToolCallID == "" &&
+			len(m.ToolCalls) > 0 && wire["tool_calls"] == nil && emptyAssistantContent(wire["content"]) {
+			continue
+		}
+		messages = append(messages, wire)
+	}
+
+	mode := strings.ToLower(d.cfg.PromptMode)
+	if mode == "" {
+		mode = "custom"
+	}
+	if opts.systemAsUser {
+		// The retry must carry the caller's OWN system text, moved — not the
+		// replaced or stripped version — or the agent's instructions are lost
+		// and the model behaves like a different agent (BP-93).
+		messages = moveSystemToUser(messages)
+	} else if mode == "custom" && d.promptReplace.Load() {
+		messages = prompt.ReplaceSystem(messages, prompt.DefaultSystemPrompt)
+	} else {
+		messages = prompt.StripSystem(messages)
+	}
+	// BP-227: a system whose opener line the 11128 check already refused
+	// gets the comma set BEFORE the first byte — the cache spares later
+	// requests the 400 + retry round trip. Applied after the mode handling:
+	// a replaced or stripped system cannot trip the check, and the rewrite
+	// only touches lines that match the opener shape.
+	if opts.commaOpeners || d.needsCommaSystem(systemKeyOfReq(req)) {
+		commaOpeners(messages)
+	}
+
+	body := map[string]any{
+		"model":    call.UpstreamModel,
+		"messages": messages,
+		"stream":   true, // forced: upstream rejects non-stream
+	}
+	if req.Temperature != nil {
+		body["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		body["top_p"] = *req.TopP
+	}
+	if req.MaxTokens > 0 {
+		body["max_tokens"] = req.MaxTokens
+	}
+	if len(req.Stop) > 0 {
+		body["stop"] = req.Stop
+	}
+	if len(req.Tools) > 0 {
+		var tools []map[string]any
+		for _, t := range req.Tools {
+			fn := map[string]any{"name": t.Name}
+			if t.Description != "" {
+				fn["description"] = t.Description
+			}
+			if t.Parameters != nil {
+				// Type every enum before sending: this upstream answers 400
+				// code 11133 for an enum with no type or with several types,
+				// which MCP servers emit routinely (2026-10-21).
+				params := t.Parameters
+				if prompt.FixEnumTypes(params) {
+					log.Printf("workbuddy: typed enum(s) in tool %q schema", t.Name)
+				}
+				// BP-191 (misakano 854e74cd): Kimi rejects a request whose
+				// tool schema still carries "$ref" — MCP definitions share
+				// their branches through "#/$defs/…". Resolve them inline at
+				// the root, dropping no tool (the upstream has no name-based
+				// trimming either). CN realm only: the international Kimi has
+				// no field evidence, and the expansion is a rewrite the
+				// global edge never asked for.
+				if creds.RealmOrDefault() != "global" && kimiRouted(call.UpstreamModel) && prompt.ExpandLocalRefs(params) {
+					log.Printf("workbuddy: expanded $defs refs in tool %q schema", t.Name)
+				}
+				fn["parameters"] = params
+			}
+			tools = append(tools, map[string]any{"type": "function", "function": fn})
+		}
+		body["tools"] = tools
+		if tc, ok := req.ToolChoice.(string); ok {
+			body["tool_choice"] = tc // string form only; upstream rejects objects
+		}
+	}
+	if req.RequestedEffort != "" {
+		// upstream effort gears: minimal|low|medium|high (invalid values are
+		// downgraded upstream-side to the model default). The international
+		// (realm=global) deployment only accepts "high": sending low/max there
+		// is rejected upstream, so it is pinned (misakano upstream parity,
+		// 2026-10-21).
+		effort := req.RequestedEffort
+		// BP-130: "off"/"none" is not a gear upstream — sending it gets the
+		// model default, and field evidence says DeepSeek still produced 150+
+		// chars of thinking (misakano e7d1e70 honorClose). The upstream's own
+		// way to switch thinking off is thinking:{"type":"disabled"} with NO
+		// reasoning_effort. DeepSeek-family models only: GLM has no observed
+		// disabled switch, so for it we just stop sending an invalid gear.
+		if effort == "off" || effort == "none" || effort == "disabled" {
+			delete(body, "reasoning_effort")
+			if strings.HasPrefix(strings.ToLower(call.UpstreamModel), "deepseek") {
+				body["thinking"] = map[string]any{"type": "disabled"}
+			}
+		} else {
+			if creds.RealmOrDefault() == "global" {
+				effort = "high"
+			}
+			body["reasoning_effort"] = effort
+		}
+	} else if strings.HasPrefix(strings.ToLower(call.UpstreamModel), "deepseek") {
+		// BP-177 (misakano f4d48ac, measured 2026-10-28 on www.workbuddy.ai):
+		// a chat that names no effort goes WITHOUT reasoning_effort, and
+		// upstream treats that as "don't think" — deepseek-v4.1-flash
+		// answered 0 reasoning tokens. The model config's own default
+		// (reasoning.defaultEffort) is "high" and that is what WorkBuddy's
+		// client sends. DeepSeek family only: other families' defaults are
+		// unverified, so they stay unset. An explicit off/none still takes
+		// the BP-130 disabled path above.
+		body["reasoning_effort"] = "high"
+	}
+	// prompt_cache_key injection (per-account stable key, panel parity).
+	prompt.InjectPromptCacheKey(body, creds.UID, sessionFromReq(req))
+
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return prompt.SanitizeBody(raw), nil
+}
+
+// moveSystemToUser rewrites the conversation so the caller's system prompt is
+// read to the model as the first thing the user says, inside <instructions>
+// tags, with the upstream's own default system line first.
+//
+// Why: WorkBuddy's channel check reads system and assistant messages only and
+// refuses the whole request (400 code 11128 "Illegal API invocation from an
+// unapproved channel") when it recognizes an agent identity line there. The
+// identical text in a user message, a user message's parts, or a tool result
+// passes. Both official builds also insist the first message IS a system
+// prompt, hence the neutral lead (BP-93, field findings recorded by
+// magpie-community/plugins workbuddy 0.1.29).
+//
+// A system message further down the conversation becomes a user message where
+// it stands, so nothing is silently dropped.
+func moveSystemToUser(messages []map[string]any) []map[string]any {
+	if len(messages) == 0 {
+		return messages
+	}
+	var lead []string
+	i := 0
+	for ; i < len(messages); i++ {
+		if role, _ := messages[i]["role"].(string); role != "system" {
+			break
+		}
+		lead = append(lead, messageText(messages[i]["content"]))
+	}
+	out := make([]map[string]any, 0, len(messages)+1)
+	out = append(out, map[string]any{"role": "system", "content": prompt.DegradedSystemPrompt})
+	for _, m := range messages[i:] {
+		if role, _ := m["role"].(string); role == "system" {
+			m = map[string]any{"role": "user", "content": messageText(m["content"])}
+		}
+		out = append(out, m)
+	}
+	said := strings.TrimSpace(strings.Join(lead, "\n\n"))
+	if said != "" {
+		block := "<instructions>\n" + said + "\n</instructions>"
+		at := -1
+		for j, m := range out {
+			if role, _ := m["role"].(string); role == "user" {
+				at = j
+				break
+			}
+		}
+		if at < 0 {
+			out = append(out, map[string]any{"role": "user", "content": block})
+		} else {
+			switch c := out[at]["content"].(type) {
+			case string:
+				out[at] = map[string]any{"role": "user", "content": block + "\n\n" + c}
+			case []map[string]any:
+				out[at] = map[string]any{"role": "user",
+					"content": append([]map[string]any{{"type": "text", "text": block}}, c...)}
+			default:
+				out[at] = map[string]any{"role": "user", "content": block}
+			}
+		}
+	}
+	return out
+}
+
+// messageText flattens a wire message's content to text.
+func messageText(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []map[string]any:
+		var parts []string
+		for _, p := range c {
+			if t, ok := p["text"].(string); ok && t != "" {
+				parts = append(parts, t)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+// emptyAssistantContent reports whether the serialized content carries no
+// text at all: nil, an empty part array, or whitespace-only text parts.
+func emptyAssistantContent(v any) bool {
+	switch c := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []map[string]any:
+		if len(c) == 0 {
+			return true
+		}
+		for _, p := range c {
+			if t, ok := p["text"].(string); ok && strings.TrimSpace(t) != "" {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func sessionFromReq(req *ir.ChatRequest) string {
+	if req.SessionKey != "" {
+		return req.SessionKey
+	}
+	// Deliberately no surrogate. The old fallback returned "t<len(text)>",
+	// i.e. the message LENGTH — unrelated conversations with equal-length
+	// prompts shared one upstream cache slot (2026-10-20 cross-conversation
+	// contamination). No stable identity means no cache key at all.
+	return ""
+}
+
+// parseStream consumes the upstream SSE stream.
+func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
+
+	out := &ir.ChatResponse{
+		Model:     call.Request.Model,
+		CreatedAt: time.Now().Unix(),
+		Message:   ir.Message{Role: ir.RoleAssistant},
+	}
+	var (
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		toolAcc    = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
+	)
+	for sc.Scan() {
+		if err := ctx.Err(); err != nil {
+			return nil, uperr.New(uperr.ClassCanceled, 0, "workbuddy: stream canceled: %v", err)
+		}
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			// Non-SSE error frame (upstream sometimes inlines JSON errors).
+			if strings.HasPrefix(line, "{") {
+				if code, msg, ok := detectBusinessError([]byte(line)); ok {
+					e := classifyBusiness(code, msg, call.UpstreamModel)
+					attachQueueRetryAfter(e, []byte(line))
+					return nil, e
+				}
+			}
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			terminated = true
+			break
+		}
+		// Business-error frames arrive as HTTP 200 with an error body.
+		if code, msg, ok := detectBusinessError([]byte(payload)); ok {
+			e := classifyBusiness(code, msg, call.UpstreamModel)
+			attachQueueRetryAfter(e, []byte(payload))
+			return nil, e
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int      `json:"prompt_tokens"`
+				CompletionTokens int      `json:"completion_tokens"`
+				Credit           *float64 `json:"credit"`
+				// Prefix-cache accounting (DeepSeek/GLM convention): the hit
+				// size is what the panel's cache-rate column divides by the
+				// prompt size — observed live on this upstream (BP-53).
+				PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
+				PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.ReasoningContent != "" {
+				thinkBuf.WriteString(ch.Delta.ReasoningContent)
+				if err := emit(ir.StreamEvent{Kind: ir.EvThinking, Delta: ch.Delta.ReasoningContent}); err != nil {
+					return nil, err
+				}
+			}
+			if ch.Delta.Content != "" {
+				textBuf.WriteString(ch.Delta.Content)
+				if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: ch.Delta.Content}); err != nil {
+					return nil, err
+				}
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				acc, ok := toolAcc[tc.Index]
+				if !ok {
+					acc = &ir.ToolCall{ID: tc.ID, Name: tc.Function.Name}
+					toolAcc[tc.Index] = acc
+					toolOrder = append(toolOrder, tc.Index)
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: tc.Index, ToolCall: &ir.ToolCall{ID: acc.ID, Name: acc.Name}}); err != nil {
+						return nil, err
+					}
+				}
+				if tc.Function.Arguments != "" {
+					acc.Arguments += tc.Function.Arguments
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: tc.Index, Delta: tc.Function.Arguments}); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if ch.FinishReason != "" {
+				// BP-222: finish_reason "error" is the vendor's word for a
+				// failed turn, not a finished one — fail the attempt instead of
+				// reporting a half answer as a success (ClassTransport: no
+				// account penalty; the gateway cascades or continues).
+				if ir.FinishReasonFailed(ch.FinishReason) {
+					return nil, uperr.NewFailedFinishTurn("workbuddy")
+				}
+				terminated = true
+				stop = mapFinish(ch.FinishReason)
+			}
+		}
+		if chunk.Usage != nil {
+			usage = ir.Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
+			if chunk.Usage.Credit != nil {
+				usage.Credit = *chunk.Usage.Credit
+				usage.CreditKnown = true
+			}
+			if chunk.Usage.PromptCacheHitTokens != nil {
+				usage.CachedInputTokens = *chunk.Usage.PromptCacheHitTokens
+				usage.CacheKnown = true
+			} else if chunk.Usage.PromptCacheMissTokens != nil && chunk.Usage.PromptTokens > 0 {
+				// Miss-only frame: the hit size is the remainder of the prompt.
+				usage.CacheKnown = true
+				if hit := chunk.Usage.PromptTokens - *chunk.Usage.PromptCacheMissTokens; hit > 0 {
+					usage.CachedInputTokens = hit
+				}
+			}
+			gotUsage = true
+		}
+	}
+	if err := sc.Err(); err != nil {
+		if httpx.IdleFired(r) {
+			return nil, uperr.New(uperr.ClassUpstreamTimeout, 0,
+				"workbuddy: stream stalled (no data for %s)", httpx.IdleTimeout())
+		}
+		if ctx.Err() != nil {
+			return nil, uperr.New(uperr.ClassCanceled, 0, "workbuddy: stream canceled: %v", ctx.Err())
+		}
+		return nil, uperr.New(uperr.ClassTransport, 0, "workbuddy: stream read: %v", err)
+	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "workbuddy: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "workbuddy: stream ended without terminal signal")
+	}
+
+	for _, idx := range toolOrder {
+		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
+	}
+	if len(out.Message.ToolCalls) > 0 && stop == ir.StopEnd {
+		stop = ir.StopToolUse
+	}
+	if stop == "" {
+		stop = ir.StopEnd
+	}
+	out.Message.Content = []ir.ContentPart{{Kind: "text", Text: textBuf.String()}}
+	out.Thinking = thinkBuf.String()
+	out.StopReason = stop
+	out.Usage = usage
+	if gotUsage {
+		if err := emit(ir.StreamEvent{Kind: ir.EvUsage, Usage: &usage}); err != nil {
+			return nil, err
+		}
+	}
+	if err := emit(ir.StreamEvent{Kind: ir.EvDone, Stop: stop}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func mapFinish(reason string) ir.StopReason {
+	switch strings.ToLower(reason) {
+	case "stop":
+		return ir.StopEnd
+	case "length":
+		return ir.StopLength
+	case "tool_calls":
+		return ir.StopToolUse
+	case "content_filter":
+		return ir.StopContentFilter
+	default:
+		return ir.StopEnd
+	}
+}
+
+// openerCommaRe is BP-227's rewrite: WorkBuddy's 11128 channel check matches
+// another agent's opener line WHOLE, and a comma between the agent noun and
+// its "powered by / running on / …" phrase breaks the signature while
+// keeping the line — and the harness name the rest of the prompt refers
+// back to — intact (plugins 79b02cc5 measured 400→200; 3968cdd7 generalized
+// the shape).
+var openerCommaRe = regexp.MustCompile(`(?i)(\bYou are (?:an?|the)\s[^\n.,]{0,60}?\b(?:agent|assistant))\s+(powered by|running on|running in|built on|based on)\b`)
+
+// commaOpeners sets the opener comma in the wire messages WorkBuddy reads —
+// its own words: system and assistant messages only.
+func commaOpeners(messages []map[string]any) {
+	for _, m := range messages {
+		role, _ := m["role"].(string)
+		if role != "system" && role != "assistant" {
+			continue
+		}
+		switch c := m["content"].(type) {
+		case string:
+			if ns := openerCommaRe.ReplaceAllString(c, "$1, $2"); ns != c {
+				m["content"] = ns
+			}
+		case []map[string]any:
+			for _, p := range c {
+				if t, ok := p["text"].(string); ok {
+					if ns := openerCommaRe.ReplaceAllString(t, "$1, $2"); ns != t {
+						p["text"] = ns
+					}
+				}
+			}
+		}
+	}
+}
+
+// systemKeyOfReq hashes the request's own system text — the identity the
+// comma cache keys on (stable across turns of one conversation).
+func systemKeyOfReq(req *ir.ChatRequest) string {
+	var b strings.Builder
+	for _, m := range req.Messages {
+		if m.Role != ir.RoleSystem {
+			continue
+		}
+		b.WriteString(ir.TextOf(m.Content))
+		b.WriteByte(0)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:16])
+}
+
+// rememberCommaSystem records a system whose comma rewrite cleared 11128.
+// Bounded: a runaway cache must not grow with the process lifetime.
+func (d *Driver) rememberCommaSystem(key string) {
+	d.comma11128Mu.Lock()
+	defer d.comma11128Mu.Unlock()
+	if d.comma11128 == nil {
+		d.comma11128 = make(map[string]struct{})
+	}
+	if len(d.comma11128) >= 1024 {
+		return
+	}
+	d.comma11128[key] = struct{}{}
+}
+
+func (d *Driver) needsCommaSystem(key string) bool {
+	d.comma11128Mu.Lock()
+	defer d.comma11128Mu.Unlock()
+	_, ok := d.comma11128[key]
+	return ok
+}
+
+// detectBusinessError finds a business code + message in a JSON body.
+//
+// Message fields: upstream billing envelopes carry the text in `msg`
+// (agentpoints apiEnvelope parity); SSE/OpenAI-style bodies use `message`
+// or nested error.message. All three are read — dropping `msg` used to lose
+// every billing error's text (ticket 30: the checkin duplicate rejection
+// arrived as code=10001 with the reason only in `msg`).
+func detectBusinessError(raw []byte) (int, string, bool) {
+	// The "error" key carries TWO shapes: the /v1/messages envelope's flat
+	// string ({"code":11102,"error":"11158:model … is not allowed …"}, live
+	// 2026-10-27) and the nested object ({"error":{"code":6004,…}}). One
+	// RawMessage + shape dispatch — two same-tag fields make encoding/json
+	// treat the pair as ambiguous and fill NEITHER, silently losing every
+	// nested error.
+	var doc struct {
+		Code    any             `json:"code"`
+		Msg     string          `json:"msg"`
+		Message string          `json:"message"`
+		Error   json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return 0, "", false
+	}
+	pick := func(msg, message string) string {
+		if msg != "" {
+			return msg
+		}
+		return message
+	}
+	code := toInt(doc.Code)
+	msg := pick(doc.Msg, doc.Message)
+	if len(doc.Error) > 0 && code == 0 || msg == "" && len(doc.Error) > 0 {
+		if len(doc.Error) > 0 && doc.Error[0] == '{' {
+			var nested struct {
+				Code    any    `json:"code"`
+				Msg     string `json:"msg"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(doc.Error, &nested) == nil && code == 0 {
+				code = toInt(nested.Code)
+				msg = pick(nested.Msg, nested.Message)
+			}
+		} else if msg == "" {
+			var es string
+			if json.Unmarshal(doc.Error, &es) == nil {
+				msg = es
+			}
+		}
+	}
+	if code == 0 {
+		return 0, "", false
+	}
+	return code, msg, true
+}
+
+func toInt(v any) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case string:
+		n := 0
+		for _, c := range t {
+			if c < '0' || c > '9' {
+				return 0
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+// attachQueueRetryAfter fills the queue signals' own wait. 6020 arrives with
+// data.retry_after (misakano f07eba54: "6020 带 data.retry_after=40"); without
+// it the client guesses. 缺省 5s per the same reference — a queue that names
+// no wait is a short one.
+func attachQueueRetryAfter(e *uperr.Error, body []byte) {
+	if e == nil || e.Class != uperr.ClassUpstreamBusy {
+		return
+	}
+	var doc struct {
+		Data struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &doc) == nil && doc.Data.RetryAfter > 0 {
+		e.ResetAt = time.Now().Add(time.Duration(doc.Data.RetryAfter) * time.Second)
+		return
+	}
+	e.ResetAt = time.Now().Add(5 * time.Second)
+}
+
+// classifyBusiness maps a business code to the error taxonomy.
+func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
+	switch code {
+	case codeModelRate:
+		e := uperr.New(uperr.ClassModelRate, 200, "workbuddy: %s", msg)
+		e.Model = upstreamModel
+		e.Code = fmt.Sprint(code)
+		e.ResetAt = parseResetWallClock(msg)
+		return e
+	case codeModelQuota:
+		// misakano cdad965: 6000 whose message names the escape hatch
+		// ("切换其他模型") means THIS model's quota is gone — same model-scoped
+		// handling as 6004. Without the hint it is the account's own quota
+		// window: account-level rest with the stated reset, no disable.
+		if strings.Contains(msg, "切换其他模型") {
+			e := uperr.New(uperr.ClassModelRate, 200, "workbuddy: %s", msg)
+			e.Model = upstreamModel
+			e.Code = fmt.Sprint(code)
+			e.ResetAt = parseResetWallClock(msg)
+			return e
+		}
+		e := uperr.New(uperr.ClassSoftRate, 429, "workbuddy: %s", msg)
+		e.Code = fmt.Sprint(code)
+		e.ResetAt = parseResetWallClock(msg)
+		return e
+	case codeQueueFull, codeQueueWaiting:
+		// Upstream capacity, not the account: no rotation, no account
+		// penalty; the pool marks the channel+model busy so follow-up
+		// requests fail fast until the queue drains.
+		e := uperr.New(uperr.ClassUpstreamBusy, 429, "workbuddy: upstream queue busy: %s", msg)
+		e.Model = upstreamModel
+		return e
+	case codeBadParams:
+		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: %s", msg)
+	case codeChannelRefused:
+		// The channel check refused the caller's system prompt. Request-level:
+		// no account penalty, and the driver retries once with the prompt moved
+		// into the user turn (BP-93). The code stays in the message so the
+		// retry can recognize it.
+		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: 11128 channel refused: %s", msg)
+	case codeAccountRestricted:
+		// Same code carries two meanings; the wording decides (see the
+		// constant's comment). Rate-limit wording keeps the account usable.
+		lowerMsg := strings.ToLower(msg)
+		if strings.Contains(lowerMsg, "rate") || strings.Contains(lowerMsg, "limit") {
+			e := uperr.New(uperr.ClassSoftRate, 429, "workbuddy: %s", msg)
+			e.ResetAt = parseResetWallClock(msg)
+			return e
+		}
+		// "request illegal" / "account restricted": the account is banned
+		// upstream. Rotate away and stop selecting it.
+		return uperr.New(uperr.ClassAccountRestricted, 403, "workbuddy: account restricted by upstream: %s", msg)
+	case codeSessionDead:
+		return uperr.New(uperr.ClassAuth, 401, "workbuddy: %s", msg)
+	case 1001, 1002, 1003, 10001, 14001:
+		// BP-201 (plugins 3f73907): the meter checkin's own refusal family —
+		// 1001 already checked in, 1002 not eligible today, 1003 activity not
+		// open (10001/14001 are the historical already-checked-in pair,
+		// ticket 30). None of the family is fixable by a retry;
+		// IsAlreadyCheckin reads the code so the task ledger records the
+		// day's done state instead of a failure.
+		e := uperr.New(uperr.ClassBadRequest, 400, "workbuddy: checkin not claimable: %s", msg)
+		e.Code = fmt.Sprint(code)
+		return e
+	default:
+		// Business-code branch runs before the status fallbacks, so a
+		// request-level rejection must be recognized HERE too — otherwise
+		// code 11115 ("prompt is too long") lands in the generic internal
+		// bucket and the status branch never sees it.
+		lowerMsg := strings.ToLower(msg)
+		// 11158 "model not allowed for user type": live 2026-10-27 on the CN
+		// deployment — the route KNOWS the claude ids (the error echoes the
+		// name) but refuses them for personal_free_user accounts, and the
+		// /v1/messages envelope wraps it as code 11102 with "11158:…" in the
+		// error string. The account is fine on its other models: model-scoped
+		// hold, account untouched (the /v1/messages wrapper classification is
+		// what the messages lane actually surfaces).
+		if code == 11158 || code == 11102 || strings.HasPrefix(msg, "11158:") ||
+			strings.Contains(lowerMsg, "not allowed for user type") {
+			e := uperr.New(uperr.ClassModelRate, 200, "workbuddy: model not allowed for this account type (11158): %s", msg)
+			e.Model = upstreamModel
+			e.Code = "11158"
+			return e
+		}
+		if code == codePromptTooLong || isPromptTooLong(lowerMsg) {
+			return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: prompt too long: %s", msg)
+		}
+		if strings.Contains(msg, "积分") || strings.Contains(lowerMsg, "credit") {
+			return uperr.New(uperr.ClassHardCredit, 402, "workbuddy: %s", msg)
+		}
+		if strings.Contains(msg, "拦截") || strings.Contains(lowerMsg, "blocked") || strings.Contains(msg, "审核") {
+			return uperr.New(uperr.ClassContentBlocked, 400, "workbuddy: %s", msg)
+		}
+		return uperr.New(uperr.ClassInternal, 200, "workbuddy: code=%d %s", code, msg)
+	}
+}
+
+// resetWallClockRe captures date, the UTC sign/offset when stated, and the
+// time of a reset moment.
+var resetWallClockRe = regexp.MustCompile(
+	`(\d{4}[-/]\d{2}[-/]\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*\(?\s*UTC([+-])(\d{1,2})(?::(\d{2}))?\)?)?`)
+
+// parseResetWallClock extracts reset moments from a rate-limit message. Two
+// shapes exist: CN bare wall clock (CST) — "将在 2026-10-14 15:30:00 重置" —
+// and the international one with an explicit offset — "usage will reset at
+// 2026-10-25 22:34:25 UTC+8" (Coding2API 9ba8b80; the old scanner only knew
+// the bare form, so every intl reset fell back to the constant backoff and
+// the account re-hit the wall until the real reset passed).
+func parseResetWallClock(msg string) time.Time {
+	if m := resetWallClockRe.FindStringSubmatch(msg); m != nil {
+		layout := "2006-01-02 15:04:05"
+		if strings.Contains(m[1], "/") {
+			layout = "2006/01/02 15:04:05"
+		}
+		loc := time.FixedZone("CST", 8*3600)
+		if m[3] != "" { // groups: 1 date, 2 time, 3 sign, 4 hours, 5 minutes
+			off, _ := strconv.Atoi(m[4])
+			mins := 0
+			if m[5] != "" {
+				mins, _ = strconv.Atoi(m[5])
+			}
+			if m[3] == "-" {
+				off = -off
+				mins = -mins
+			}
+			loc = time.FixedZone("UTC±", off*3600+mins*60)
+		}
+		if t, err := time.ParseInLocation(layout, m[1]+" "+m[2], loc); err == nil {
+			return t
+		}
+	}
+	layouts := []string{"2006-01-02 15:04:05", "2006/01/02 15:04:05"}
+	for i := 0; i+19 <= len(msg); i++ {
+		seg := msg[i : i+19]
+		for _, layout := range layouts {
+			if t, err := time.ParseInLocation(layout, seg, time.FixedZone("CST", 8*3600)); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// isPromptTooLong reports the upstream's over-context marker: business code
+// 11115 or the literal wording. The caller passes a lowercased body. Both the
+// JSON-envelope shape and the plain-text shape are covered because the edge
+// sometimes answers with a bare message instead of an envelope.
+func isPromptTooLong(lowerBody string) bool {
+	if strings.Contains(lowerBody, "11115") {
+		return true
+	}
+	return strings.Contains(lowerBody, "prompt is too long") ||
+		strings.Contains(lowerBody, "context length exceeded") ||
+		strings.Contains(lowerBody, "context_too_long")
+}
+
+// applyClientFingerprint sends the official WorkBuddy desktop client's header
+// family on chat requests.
+//
+// Why: the chat edge classifies traffic. Requests carrying only the four
+// transport headers (content-type/auth/Accept/device) look like a script, and
+// upstream later marks the ACCOUNT as "unusual activity" (403 code=11140
+// "request illegal", displayMsg 账号存在异常行为，已被限制使用 — field
+// diagnosis 2026-10-20). The reference projects send the same family on every
+// call for that reason.
+//
+// Values are stable derivations from the account uid/session key, never random
+// per request: the official client reuses one conversation id per
+// conversation, so rotating them would look *more* suspicious. Their *shapes*
+// matter too — see identity.go (BP-90).
+//
+// Set channels.workbuddy.disable_client_fingerprint to turn this off.
+func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call driver.ChatCall) {
+	if d.cfg.DisableClientFingerprint {
+		return
+	}
+	global := creds.RealmOrDefault() == "global"
+	// BP-170: the CN client's origin moved to www.workbuddy.cn (misakano
+	// 47f1ed61: not one real request hits codebuddy.cn any more) — X-Domain,
+	// Origin and Referer all derive from this.
+	origin, lang := "https://www.workbuddy.cn", "zh-CN"
+	if global {
+		origin, lang = "https://www.workbuddy.ai", "en-US"
+	}
+	req.Header.Set("User-Agent", workBuddyUA(global))
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	// X-Product is the SKU segment: the real client always sends "SaaS" and
+	// carries the product name in X-IDE-Name/Type instead. Sending "WorkBuddy"
+	// here is a same-header-different-value tell — easier to match on than an
+	// extra header would be (BP-90, official captures of both packages).
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Agent-Purpose", "conversation")
+	req.Header.Set("X-IDE-Name", "WorkBuddy")
+	req.Header.Set("X-IDE-Type", "WorkBuddy")
+	req.Header.Set("X-IDE-Version", workBuddyClientVersion(global))
+	// BP-158/BP-197: WorkBuddy 5.9's desktop local transport announces the
+	// agent runtime. Originally only the CN build sent it (BP-158); the
+	// international feed has since moved to the same 5.9.3 build and sends
+	// it too (magpie 17114b5, plugins b08a6c1, 2026-10-29) — keeping the
+	// global lane silent would now be the stale fingerprint.
+	req.Header.Set("X-Agent-Runtime", "local-agent")
+	// BP-144: a key account is personal with no domain and no enterprise, and
+	// the CLI sends neither — an X-Domain on a key request is a shape upstream
+	// never sees from its own client.
+	if !creds.IsAPIKey() {
+		req.Header.Set("X-Domain", strings.TrimPrefix(origin, "https://"))
+	}
+	if creds.IsAPIKey() {
+		// The CLI's key identity: "anonymous_" + the key's last 8 characters.
+		req.Header.Set("X-User-Id", apiKeyUserID(creds.APIKey))
+	} else if creds.UID != "" {
+		req.Header.Set("X-User-Id", creds.UID)
+	} else if uid := uidFromJWT(creds.AccessToken); uid != "" {
+		// BP-206 (Coding2API bd48203): the official client sends X-User-Id on
+		// every request; an account imported by access token alone has no
+		// stored UID, and a chat without the header is an automation tell of
+		// its own. The JWT "sub" claim is the same identity the login flow
+		// stores as UID.
+		req.Header.Set("X-User-Id", uid)
+	}
+	// Browser/CLI-shaped headers the desktop client never sends on chat:
+	// Origin, Referer, Accept-Language, X-Machine-ID and X-Session-ID came
+	// from the CodeBuddy CLI's conventions. The official packages omit every
+	// one of them here (BP-90) — an extra header is a fingerprint in its own
+	// right. (BP-225: X-Requested-With left this list — the 2026-10-30
+	// captures show the chat SDK chain DOES carry it, below.)
+	//
+	// channels.workbuddy.send_browser_headers restores them for A/B work.
+	if d.cfg.SendBrowserHeaders {
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Referer", origin+"/")
+		req.Header.Set("Accept-Language", lang)
+		req.Header.Set("X-No-Enterprise-Id", "true")
+		machine := stableHex(uidSeed(creds, call) + "|machine")
+		req.Header.Set("X-Machine-ID", machine)
+		req.Header.Set("X-Session-ID", machine)
+	}
+	// BP-225 (misakano 847deb10 global-5.9.4 golden): the chat SDK chain
+	// carries X-Requested-With — it is the REST family (/v2/report, refresh,
+	// login) that never does. BP-90's older captures predate this family
+	// split; keeping the header chat-only matches both captures.
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// BP-225 (misakano 847deb10): the value flips per DISTRIBUTION, not per
+	// account tier — the international build ships DefaultModelOptimizationOff
+	// =true (applyPrivateDataHeaderPolicy decompile), so its personal accounts
+	// declare "true" (4/4 real captures) while CN personal accounts send
+	// "false" (the BP-170 capture set, still valid for CN). Enterprise builds
+	// send "true" on both; we serve none. BP-170's pinned "false" was a CN
+	// capture wearing an international hat.
+	if global {
+		req.Header.Set("X-Private-Data", "true")
+	} else {
+		req.Header.Set("X-Private-Data", "false")
+	}
+	// The openai-node SDK / agent segment the client also sends.
+	req.Header.Set("X-Agent-Type", "main")
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Stainless-Package-Version", stainlessSDKVersion)
+	req.Header.Set("X-Stainless-OS", "Windows")
+	req.Header.Set("X-Stainless-Arch", "x64")
+	req.Header.Set("X-Stainless-Runtime", "node")
+	req.Header.Set("X-Stainless-Runtime-Version", stainlessNodeVersion)
+	req.Header.Set("X-Stainless-Retry-Count", "0")
+	// BP-158: the official SDK's own timeout header, present on both builds.
+	req.Header.Set("X-Stainless-Timeout", "1200")
+
+	// Conversation header family. Every id here has the shape the real client
+	// sends: a dashed UUID v4 for the conversation, millisecond-prefixed 32-hex
+	// for per-message ids, and unrelated random values for trace/span.
+	seed := uidSeed(creds, call)
+	sk := call.Request.SessionKey
+	var conv, convReq, acp string
+	if sk != "" {
+		conv = stableUUIDV4(seed, sk, "")
+		// Turn-level aggregation key: stable per conversation, and a different
+		// value from the conversation id (the client keeps them apart).
+		convReq = stableUUIDV4(seed, sk, "turn")
+		acp = stableUUIDV4(seed, sk, "acp")
+	} else {
+		// No stable conversation identity: mint fresh ids. A constant fallback
+		// told upstream that every unrelated conversation was the same one —
+		// the 2026-10-20 field bug where two ZCode sessions shared a
+		// conversation id and the model's answers/images crossed over.
+		conv, convReq, acp = randomUUIDV4(), randomUUIDV4(), randomUUIDV4()
+	}
+	msg := newMessageID()
+	trace := newTraceID()
+	span := newSpanID()
+	parent := newSpanID()
+	req.Header.Set("X-Conversation-ID", conv)
+	req.Header.Set("X-Conversation-Request-ID", convReq)
+	req.Header.Set("X-Conversation-Message-ID", msg)
+	req.Header.Set("X-Request-ID", msg)
+	req.Header.Set("X-Root-Request-ID", convReq)
+	// Trace and request ids never correlate on the real client: X-Trace-ID is
+	// its own random value and B3 follows the trace, not the request.
+	req.Header.Set("X-Trace-ID", trace)
+	req.Header.Set("X-B3-TraceId", trace)
+	req.Header.Set("X-B3-SpanId", span)
+	req.Header.Set("X-B3-ParentSpanId", parent)
+	req.Header.Set("X-B3-Sampled", "1")
+	// The client also sends the single-header b3 and W3C traceparent forms.
+	// Sending only the X-B3-* trio is a shape it never produces.
+	req.Header.Set("b3", trace+"-"+span+"-1-"+parent)
+	req.Header.Set("traceparent", "00-"+trace+"-"+span+"-01")
+	req.Header.Set("acp-connection-id", acp)
+	// BP-225 (misakano 847deb10, TestGLBaggageExactMembers): the chat chain
+	// carries W3C baggage with EXACTLY four members in this order, the two
+	// buddy keys empty. An earlier read put x-agent-runtime/x-agent-intent in
+	// here too — the real client keeps those in their own headers, and any
+	// extra member is a fingerprint of its own.
+	req.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conv+",codebuddy.conversation_request_id="+convReq)
+}
+
+// uidSeed is the per-account isolation seed for derived ids.
+func uidSeed(creds *Creds, call driver.ChatCall) string {
+	if creds.UID != "" {
+		return creds.UID
+	}
+	if call.Account != nil {
+		return call.Account.ID
+	}
+	return ""
+}
+
+// stableHex derives a 32-hex id from a seed (deterministic per account/session,
+// never per request).
+func stableHex(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:16])
+}
+
+// randomHex returns a fresh 32-hex id for requests that carry no stable
+// conversation identity.
+func randomHex() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+		return hex.EncodeToString(sum[:16])
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// wbGzipThreshold is the body size past which the official client gzips its
+// model requests (misakano 47f1ed61).
+const wbGzipThreshold = 1024
+
+// nakedHost strips the scheme from a base URL: X-Domain carries the bare
+// hostname (misakano 8ecf115a), never "https://…".
+func nakedHost(base string) string {
+	base = strings.TrimPrefix(base, "https://")
+	return strings.TrimPrefix(base, "http://")
+}
+
+// classifyHTTP maps HTTP status + body to the taxonomy.
+func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
+	if code, msg, ok := detectBusinessError(body); ok {
+		e := classifyBusiness(code, msg, upstreamModel)
+		attachQueueRetryAfter(e, body)
+		return e
+	}
+	text := string(body)
+	lower := strings.ToLower(text)
+	// Account restriction without a JSON envelope: the edge sometimes answers
+	// bare text. This must be judged before the generic 403 → WAF branch,
+	// because a restricted account has to leave routing (2026-10-20).
+	// BP-171: the bare number "11140" must NOT match here — request ids,
+	// timestamps or echoed user content can carry those five digits and
+	// would disable a healthy account (Coding2API 58e18f74). The structured
+	// code path (classifyBusiness codeAccountRestricted) and the wording
+	// markers are the reliable signals.
+	if status == 403 && (strings.Contains(lower, "request illegal") ||
+		strings.Contains(lower, "account restricted") ||
+		strings.Contains(text, "异常行为")) {
+		return uperr.New(uperr.ClassAccountRestricted, status, "workbuddy: account restricted by upstream: %s", truncate(body, 300))
+	}
+	// Prompt-too-long (11115) is request-level and is judged before the
+	// status fallbacks: upstream may express it with 400, 404 or 413, and on
+	// 404 the generic branch would otherwise file it as a dead route.
+	// Rotating accounts cannot shorten a prompt.
+	// BP-232: the pace words decide FIRST — a 400 whose Chinese wording is a
+	// rate cap (「内容太长，已达到速率限制」) is the account's moment, not the
+	// request's; and the overflow detector gains the Chinese families.
+	if status == 400 && uperr.PaceLimited(text) {
+		e := uperr.New(uperr.ClassSoftRate, status, "workbuddy: rate-worded 400: %s", truncate(body, 300))
+		if upstreamModel != "" {
+			e.Model = upstreamModel
+		}
+		return e
+	}
+	if status == 400 || status == 404 || status == 413 {
+		if isPromptTooLong(lower) || uperr.Overflowed(text) {
+			// BP-244: flag it as a context overflow so the Responses writer can
+			// answer `context_length_exceeded` — the one code a client like
+			// Codex compacts on. Without the flag it is a generic 400 and the
+			// client resends the identical oversized body.
+			e := uperr.New(uperr.ClassBadRequest, status, "workbuddy: prompt too long: %s", truncate(body, 300))
+			e.ContextOverflow = true
+			return e
+		}
+	}
+	switch {
+	case status == 401:
+		return uperr.New(uperr.ClassAuth, status, "workbuddy: %s", truncate(body, 300))
+	case status == 402:
+		return uperr.New(uperr.ClassHardCredit, status, "workbuddy: %s", truncate(body, 300))
+	case status == 404:
+		// The path/model does not exist upstream: a property of the binding,
+		// identical for every account of this channel. Not a rate limit, so
+		// the pool applies no account penalty (2026-10-19).
+		return uperr.New(uperr.ClassNotFound, status, "workbuddy: %s", truncate(body, 300))
+	case status == 413:
+		// Payload too large is a request problem no account can fix.
+		return uperr.New(uperr.ClassBadRequest, status, "workbuddy: %s", truncate(body, 300))
+	case status == 429 || strings.Contains(lower, "rate") || strings.Contains(lower, "limit"):
+		e := uperr.New(uperr.ClassSoftRate, status, "workbuddy: %s", truncate(body, 300))
+		e.ResetAt = parseResetWallClock(text)
+		// BP-189 (misakano 22868bbf, PR #114): a plain soft rate limit binds to
+		// the MODEL, not the account — production showed one model's wall
+		// cooling the same account's other models with it. The pool falls back
+		// to an account rest when no model is known (the billing call).
+		if upstreamModel != "" {
+			e.Model = upstreamModel
+		}
+		return e
+	case status == 403:
+		if uperr.IsEdgeBlock(body) {
+			return uperr.EdgeBlocked(status, "workbuddy: edge blocked: %s", truncate(body, 300))
+		}
+		return uperr.New(uperr.ClassWAF, status, "workbuddy: %s", truncate(body, 300))
+	case status == 400:
+		return uperr.New(uperr.ClassBadRequest, status, "workbuddy: %s", truncate(body, 300))
+	case status >= 500:
+		return uperr.New(uperr.ClassTransport, status, "workbuddy: %s", truncate(body, 300))
+	default:
+		return uperr.New(uperr.ClassInternal, status, "workbuddy: %s", truncate(body, 300))
+	}
+}
+
+// --- credits / probe / checkin ---
+
+// BillingResource mirrors get-user-resource's per-package rows.
+type billingPackage struct {
+	PackageName         string `json:"PackageName"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CapacitySize        int64  `json:"CapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+	CycleEndTime        string `json:"CycleEndTime"`
+	ExpiredTime         string `json:"ExpiredTime"`
+	// DeductionEndTime (epoch ms): the moment the package can no longer be
+	// deducted — the REAL "use it or lose it" expiry. The upstream deducts
+	// packages FEFO by this moment (agentpoints acb3830; CycleEndTime is the
+	// period boundary and only a fallback).
+	DeductionEndTime int64  `json:"DeductionEndTime"`
+	PackageEndTime   string `json:"PackageEndTime"`
+}
+
+// parseCredits aggregates balance + expiring buckets from a
+// get-user-resource response body. Accepts both the enveloped form
+// {"code":0,"data":{"Response":...}} and the bare {"Response":...} form.
+func parseCredits(raw []byte, soon time.Duration) (*model.Credits, error) {
+	type accountsBody struct {
+		Response struct {
+			Data struct {
+				Accounts []billingPackage `json:"Accounts"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	var resp accountsBody
+	parsed := false
+	if err := json.Unmarshal(raw, &env); err == nil && len(env.Data) > 0 && env.Data[0] == '{' {
+		if err := json.Unmarshal(env.Data, &resp); err == nil {
+			parsed = true
+		}
+	}
+	if !parsed {
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, err
+		}
+	}
+	now := time.Now()
+	out := &model.Credits{UpdatedAt: now}
+	for _, p := range resp.Response.Data.Accounts {
+		remain, size := packageRemainSize(p)
+		if remain < 0 {
+			remain = 0
+		}
+		out.Remain += remain
+		out.Total += size
+		if remain <= 0 {
+			continue
+		}
+		end := parsePackageEnd(p)
+		if end.IsZero() || !end.After(now) {
+			continue
+		}
+		if out.EarliestExpiresAt.IsZero() || end.Before(out.EarliestExpiresAt) {
+			out.EarliestExpiresAt = end
+			out.EarliestRemaining = remain
+		} else if end.Equal(out.EarliestExpiresAt) {
+			out.EarliestRemaining += remain
+		}
+		if soon > 0 && !end.After(now.Add(soon)) {
+			out.Expiring += remain
+		}
+	}
+	return out, nil
+}
+
+func packageRemainSize(p billingPackage) (int64, int64) {
+	if p.CycleCapacitySize > 0 {
+		remain := p.CycleCapacityRemain
+		if remain < 0 {
+			remain = 0
+		}
+		return remain, p.CycleCapacitySize
+	}
+	remain := p.CapacityRemain
+	if remain < 0 {
+		remain = 0
+	}
+	size := p.CapacitySize
+	if size < remain {
+		size = remain
+	}
+	return remain, size
+}
+
+// parsePackageEnd resolves a package's real expiry. Priority: DeductionEndTime
+// (epoch ms — the deductible-window end, what the upstream actually deducts
+// FEFO by), then the wall-clock string fields ExpiredTime → PackageEndTime →
+// CycleEndTime (period boundary, last resort). Ticket 34, agentpoints
+// acb3830: judging "use it or lose it" by CycleEndTime misdates the expiry.
+func parsePackageEnd(p billingPackage) time.Time {
+	if p.DeductionEndTime > 0 {
+		return time.UnixMilli(p.DeductionEndTime)
+	}
+	layouts := []string{"2006-01-02 15:04:05", time.RFC3339}
+	for _, raw := range []string{p.ExpiredTime, p.PackageEndTime, p.CycleEndTime} {
+		if raw == "" {
+			continue
+		}
+		for _, layout := range layouts {
+			if t, err := time.ParseInLocation(layout, raw, time.FixedZone("CST", 8*3600)); err == nil {
+				return t
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// Probe implements driver.Prober: fetch credit balance with expiry buckets.
+func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeResult, error) {
+	creds, err := ParseCreds(acc.Credentials())
+	if err != nil {
+		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	// BP-144: a key account has no billing endpoint — the key's credits are
+	// simply unknown. Reporting an error here would paint the account red for
+	// something that is not a fault, so the probe answers "unknown" instead.
+	if creds.IsAPIKey() {
+		return &driver.ProbeResult{
+			Credits: &model.Credits{BalanceOnly: true, NotReported: true, UpdatedAt: time.Now()},
+			Note:    "API key account: credit balance is not reported by upstream",
+		}, nil
+	}
+	body := map[string]any{
+		"PageNumber":  1,
+		"PageSize":    100,
+		"ProductCode": "p_tcaca",
+		"Status":      []int{0, 3},
+	}
+	raw, err := d.billingCall(ctx, creds, "/v2/billing/meter/get-user-resource", body, 1)
+	if err != nil {
+		return nil, err
+	}
+	credits, err := parseCredits(raw, 7*24*time.Hour)
+	if err != nil {
+		return nil, uperr.New(uperr.ClassInternal, 0, "workbuddy: credits parse: %v", err)
+	}
+	return &driver.ProbeResult{Credits: credits, Note: "credit balance refreshed"}, nil
+}
+
+// CreditPackages lists the account's credit packs with per-pack expiry
+// (panel 国模积分情况 page; same billing endpoint as Probe).
+func (d *Driver) CreditPackages(ctx context.Context, acc *model.Account) ([]driver.Package, error) {
+	creds, err := ParseCreds(acc.Credentials())
+	if err != nil {
+		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	body := map[string]any{
+		"PageNumber":  1,
+		"PageSize":    100,
+		"ProductCode": "p_tcaca",
+		"Status":      []int{0, 3},
+	}
+	raw, err := d.billingCall(ctx, creds, "/v2/billing/meter/get-user-resource", body, 1)
+	if err != nil {
+		return nil, err
+	}
+	packs, err := parsePackages(raw)
+	if err != nil {
+		return nil, uperr.New(uperr.ClassInternal, 0, "workbuddy: packages parse: %v", err)
+	}
+	return packs, nil
+}
+
+// parsePackages extracts the raw billing rows with per-pack expiry.
+func parsePackages(raw []byte) ([]driver.Package, error) {
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	var resp struct {
+		Response struct {
+			Data struct {
+				Accounts []billingPackage `json:"Accounts"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	parsed := false
+	if err := json.Unmarshal(raw, &env); err == nil && len(env.Data) > 0 && env.Data[0] == '{' {
+		if err := json.Unmarshal(env.Data, &resp); err == nil {
+			parsed = true
+		}
+	}
+	if !parsed {
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]driver.Package, 0, len(resp.Response.Data.Accounts))
+	for _, p := range resp.Response.Data.Accounts {
+		remain, size := packageRemainSize(p)
+		out = append(out, driver.Package{
+			Name:     p.PackageName,
+			Remain:   remain,
+			Size:     size,
+			ExpireAt: parsePackageEnd(p),
+		})
+	}
+	return out, nil
+}
+
+// IsAlreadyCheckin reports whether err is the upstream's idempotent
+// "already checked in today" rejection: a duplicate daily checkin gets
+// code=10001/14001 with the reason in the message (已签到 / "already").
+// BP-201 (plugins 3f73907) adds the meter activity's own family: 1001
+// already checked in, 1002 not eligible, 1003 not open — none fixable by a
+// retry. Callers treat all of them as success — the task ledger used to
+// record a FAILED row for every repeat slot of the day (ticket 30).
+func IsAlreadyCheckin(err error) bool {
+	if err == nil {
+		return false
+	}
+	ue, ok := uperr.As(err)
+	if !ok {
+		return false
+	}
+	switch ue.Code {
+	case "1001", "1002", "1003", "10001", "14001":
+		return true
+	}
+	if strings.Contains(ue.Message, "已签到") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(ue.Message), "already")
+}
+
+// checkinStatusPath is the meter activity precheck (BP-201, plugins
+// 3f73907): claiming while the activity is not configured used to answer a
+// 10001-styled exception every single day; the status endpoint tells
+// whether the day is claimable at all.
+const checkinStatusPath = "/v2/billing/meter/checkin-activity-status"
+
+// Checkin performs the daily checkin. BP-201: the activity status is asked
+// first — only an active, not-yet-checked-in day earns a claim POST. A
+// precheck failure must not block the claim itself (the endpoint is newer
+// than some deployments), and a 200 body carrying {"code":10000} is the
+// upstream's own transient marker, retried twice.
+func (d *Driver) Checkin(ctx context.Context, acc *model.Account) error {
+	creds, err := ParseCreds(acc.Credentials())
+	if err != nil {
+		return uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	if active, done, err := d.checkinActivityStatus(ctx, creds); err == nil {
+		if !active {
+			log.Printf("workbuddy: checkin activity inactive, no claim sent (uid=%s)", creds.UID)
+			return nil
+		}
+		if done {
+			return nil
+		}
+	}
+	const maxTransient = 2
+	for attempt := 0; ; attempt++ {
+		raw, err := d.billingCall(ctx, creds, "/v2/billing/meter/daily-checkin", map[string]any{}, 0)
+		if err != nil {
+			return err
+		}
+		if code := checkinBodyCode(raw); code == 10000 && attempt < maxTransient {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+}
+
+// checkinActivityStatus asks the meter activity precheck. active=false means
+// the deployment has no checkin campaign configured today; done=true means
+// today is already claimed.
+func (d *Driver) checkinActivityStatus(ctx context.Context, creds *Creds) (active, done bool, err error) {
+	raw, err := d.billingCall(ctx, creds, checkinStatusPath, map[string]any{}, 0)
+	if err != nil {
+		return false, false, err
+	}
+	var st struct {
+		Active         *bool `json:"active"`
+		CheckedInSnake bool  `json:"today_checked_in"`
+		CheckedInCamel bool  `json:"todayCheckedIn"`
+	}
+	if json.Unmarshal(raw, &st) != nil {
+		return false, false, fmt.Errorf("checkin status: body not json")
+	}
+	if st.Active != nil {
+		active = *st.Active
+	} else {
+		active = true // an active-less body states no gate: claim as before
+	}
+	return active, st.CheckedInSnake || st.CheckedInCamel, nil
+}
+
+// checkinBodyCode reads a JSON body's business "code" (number or string).
+func checkinBodyCode(raw []byte) int {
+	var doc struct {
+		Code any `json:"code"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return 0
+	}
+	switch v := doc.Code.(type) {
+	case float64:
+		return int(v)
+	case string:
+		n, _ := strconv.Atoi(v)
+		return n
+	}
+	return 0
+}
+
+// ReportEvent posts a telemetry event to the upstream report endpoint.
+func (d *Driver) ReportEvent(ctx context.Context, acc *model.Account, event map[string]any) error {
+	creds, err := ParseCreds(acc.Credentials())
+	if err != nil {
+		return uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	_, err = d.billingCall(ctx, creds, "/v2/report", event, 0)
+	return err
+}
+
+// billingCall posts a JSON body to a billing/report endpoint with one
+// transient retry (upstream 5xx right after checkin is a known flake).
+func (d *Driver) billingCall(ctx context.Context, creds *Creds, path string, body any, retries int) ([]byte, error) {
+	raw, _ := json.Marshal(body)
+	var lastErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+path, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+		if creds.DeviceToken != "" {
+			req.Header.Set("X-Device-Token", creds.DeviceToken)
+		}
+		resp, err := d.rpc.Do(req)
+		if err != nil {
+			lastErr = uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy: %v", err)
+			continue
+		}
+		data, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		// Balance/checkin data feeds pool scoring; a truncated read must not
+		// pass as a valid body (ticket 11).
+		if rerr != nil {
+			log.Printf("workbuddy: billing read failed (uid=%s, endpoint=%s): %v", creds.UID, path, rerr)
+			lastErr = uperr.New(uperr.ClassTransport, 0, "workbuddy: read %s body: %v", path, rerr)
+			if attempt < retries {
+				time.Sleep(300 * time.Millisecond)
+			}
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			return data, nil
+		}
+		if resp.StatusCode >= 500 && attempt < retries {
+			lastErr = uperr.New(uperr.ClassTransport, resp.StatusCode, "workbuddy: %s", truncate(data, 200))
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		return nil, classifyHTTP(resp.StatusCode, data, "")
+	}
+	return nil, lastErr
+}
+
+// refreshPath is the real token-refresh route. The previously hardcoded
+// "/v2/plugin/auth/refresh" does not exist upstream (verified 2026-10-18:
+// 404 Route Not Found), so a dead token could never be recovered in-place and
+// the account stayed broken until a manual re-login.
+const refreshPath = "/v2/plugin/auth/token/refresh"
+
+// Refresh refreshes the access token when the refresh token flow is
+// available. WorkBuddy issues long-lived tokens (60d) via the device flow;
+// this endpoint refreshes them ahead of expiry.
+func (d *Driver) Refresh(ctx context.Context, acc *model.Account) error {
+	return d.refresh(ctx, acc, false)
+}
+
+// RefreshNow forces a token refresh regardless of the local expiry clock.
+// Needed when upstream rejects a token that has not expired yet (revoked
+// elsewhere, or a session killed server-side): gating on ExpiresAt would skip
+// exactly those accounts.
+func (d *Driver) RefreshNow(ctx context.Context, acc *model.Account) error {
+	return d.refresh(ctx, acc, true)
+}
+
+func (d *Driver) refreshOnce(ctx context.Context, creds *Creds) ([]byte, error) {
+	// The route takes the refresh token as a header and a 2-byte "{}" body
+	// (verified 2026-10-18: empty body → 400 "refreshToken is empty" when the
+	// header is missing; a bad header value → 401 code 12153). BP-175
+	// (misakano 8ecf115a, real-device capture idx 556 = 11 headers): the
+	// client also sends X-Auth-Refresh-Source: plugin and X-Request-ID, its
+	// Accept is the loose axios value, and X-Domain is the naked host without
+	// scheme. (BP-225: X-Requested-With left — the 2026-10-30 captures show
+	// the REST family never carries it; BP-175's idx-556 read was the one
+	// renderer-side sample of a different family.)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+refreshPath, strings.NewReader("{}"))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+	req.Header.Set("X-Refresh-Token", creds.RefreshToken)
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+	// BP-225 (misakano 847deb10): the REST family never sends
+	// X-Requested-With (56/56 real captures across both realms) — the old
+	// line here half-matched two header families at once.
+	req.Header.Set("X-Request-ID", randomHex())
+	req.Header.Set("User-Agent", workBuddyRestUA(creds.RealmOrDefault() == "global"))
+	req.Header.Set("X-Domain", nakedHost(d.chatBase(creds)))
+	req.Header.Set("X-Product", "SaaS")
+	if creds.UID != "" {
+		req.Header.Set("X-User-Id", creds.UID)
+	}
+	resp, err := d.rpc.Do(req)
+	if err != nil {
+		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy refresh: %v", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		// code 12153 = refresh token dead: only a re-login helps.
+		return nil, uperr.New(uperr.ClassAuth, resp.StatusCode, "workbuddy refresh: %s", truncate(data, 200))
+	}
+	var env struct {
+		Data struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn    int64  `json:"expiresIn"`
+		} `json:"data"`
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
+	}
+	tok := env.Data
+	if tok.AccessToken == "" {
+		tok = struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn    int64  `json:"expiresIn"`
+		}{env.AccessToken, env.RefreshToken, env.ExpiresIn}
+	}
+	if tok.AccessToken == "" {
+		return nil, uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
+	}
+	creds.AccessToken = tok.AccessToken
+	if tok.RefreshToken != "" {
+		creds.RefreshToken = tok.RefreshToken
+	}
+	if tok.ExpiresIn > 0 && tok.ExpiresIn < 10*365*24*3600 {
+		creds.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	}
+	updated, err := json.Marshal(creds)
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// Models returns the curated model list (dynamic discovery happens via
+// /v3/config during probes; the static list covers the core set).
+func (d *Driver) Models(ctx context.Context) ([]string, error) {
+	return []string{
+		"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo",
+		"deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash",
+		// Kimi 3.1 (BP-138): the CN catalogue spells it `kimi-k3-1` and the
+		// global one `kimi-k3.1-pro` — both verified against /v3/config on
+		// 2026-10-27 (12 and 6 kimi entries respectively). The bare
+		// `kimi-k3.1` spelling is answered 11158 "service info not found",
+		// which reads like an account-type limit but is a name error.
+		"kimi-k2.6", "kimi-k2.7", "kimi-k3", "kimi-k3-1", "kimi-k3.1-pro", "minimax-m3",
+		"hy3", "hy3-preview", "gemini-3.5-flash",
+	}, nil
+}
+
+func truncate(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "…"
+}
+
+// kimiRouted reports whether the routed upstream model is a Kimi/Moonshot
+// one (BP-191): the CN edge's Kimi is the backend that rejects $ref-carrying
+// tool schemas.
+var kimiRe = regexp.MustCompile(`kimi|moonshot`)
+
+func kimiRouted(model string) bool {
+	return kimiRe.MatchString(strings.ToLower(model))
+}
+
+// uidFromJWT extracts the "sub" claim of a JWT access token (BP-206). The
+// login flow stores the same identity as UID, so a token-only import loses
+// nothing by deriving it here.
+func uidFromJWT(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return ""
+	}
+	return claims.Sub
+}

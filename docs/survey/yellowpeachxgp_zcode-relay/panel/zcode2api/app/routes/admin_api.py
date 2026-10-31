@@ -1,0 +1,330 @@
+"""后台管理 API：/admin/api/*（账号池、设置、用量监控）。"""
+
+from __future__ import annotations
+
+import time
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from .. import settings
+from ..auth_admin import verify_admin_key
+from ..core_client import CoreClient, CoreUnavailable
+from ..models import PROVIDERS, Status
+from ..oauth import ZaiAuthFlow
+from ..quota import fetch_quota, refresh_accounts
+from ..store import store
+
+router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
+oauth_callback_router = APIRouter(prefix="/admin/api")
+
+# 进行中的 OAuth 登录流程（flow_id -> ZaiAuthFlow），需跨请求保留 poll_token
+_login_flows: dict[str, ZaiAuthFlow] = {}
+
+
+def _core() -> CoreClient | None:
+    if not settings.CORE_ENABLED:
+        return None
+    if not settings.CORE_ADMIN_KEY:
+        raise HTTPException(503, "核心不可用：未配置 ZCODE_CORE_ADMIN_KEY")
+    return CoreClient(
+        settings.CORE_URL,
+        settings.CORE_ADMIN_KEY,
+        control_url=settings.CORE_CONTROL_URL,
+        proxy_key=settings.CORE_PROXY_KEY,
+        timeout=settings.CORE_TIMEOUT,
+    )
+
+
+async def _call_core(operation):
+    try:
+        return await operation
+    except CoreUnavailable as error:
+        raise HTTPException(503, str(error)) from error
+
+
+# ── 鉴权探针 ─────────────────────────────────────────────────────────────────
+@router.get("/verify")
+async def verify():
+    return {"status": "ok"}
+
+
+# ── 账号列表 + 概览统计 ──────────────────────────────────────────────────────
+@router.get("/accounts")
+async def list_accounts():
+    core = _core()
+    if core:
+        return await _call_core(core.list_accounts())
+    now = time.time()
+    accounts = [a.public_view() for a in store.list_accounts()]
+    stats = {"total": len(accounts), "active": 0, "exhausted": 0,
+             "cooling": 0, "invalid": 0, "disabled": 0,
+             "calls": 0, "fail": 0}
+    for a in accounts:
+        st = a["status"]
+        if st in stats:
+            stats[st] += 1
+        stats["calls"] += a["use_count"]
+        stats["fail"] += a["fail_count"]
+    return {"accounts": accounts, "stats": stats, "providers": list(PROVIDERS), "ts": now}
+
+
+@router.get("/status")
+async def status_info():
+    core = _core()
+    if core:
+        return await _call_core(core.status())
+    return {
+        "providers": list(PROVIDERS),
+        "gateway_key_set": bool(store.gateway_key()),
+        "quota_pool": {
+            p: sum(1 for a in store.list_accounts(p) if a.is_selectable())
+            for p in PROVIDERS
+        },
+    }
+
+
+# ── 新增账号 ─────────────────────────────────────────────────────────────────
+@router.post("/accounts")
+async def add_accounts(payload: dict = Body(...)):
+    provider = payload.get("provider", "zai")
+    if provider not in PROVIDERS:
+        raise HTTPException(400, "不支持的 provider")
+    tokens = payload.get("tokens") or []
+    if isinstance(tokens, str):
+        tokens = [t.strip() for t in tokens.splitlines() if t.strip()]
+    tokens = [t.strip() for t in tokens if t and t.strip()]
+    if not tokens:
+        raise HTTPException(400, "请输入至少一个 Token / API Key")
+
+    core = _core()
+    if core:
+        return await _call_core(core.add_accounts(provider, tokens, payload.get("name")))
+
+    added = []
+    for tok in dict.fromkeys(tokens):  # 去重保序
+        name = payload.get("name") or f"{provider}-{len(store.list_accounts(provider)) + 1}"
+        acc = store.add_account(provider, name, tok)
+        added.append(acc.id)
+    # 立即刷新一次额度（仅 zai jwt）
+    fresh = [a for a in store.list_accounts(provider) if a.id in added and a.mode == "jwt"]
+    if fresh:
+        await refresh_accounts(fresh)
+    return {"count": len(added), "ids": added}
+
+
+# ── 删除账号 ─────────────────────────────────────────────────────────────────
+@router.delete("/accounts")
+async def delete_accounts(ids: list[str] = Body(...)):
+    core = _core()
+    if core:
+        return await _call_core(core.delete_accounts(ids))
+    deleted = 0
+    for aid in ids:
+        acc = store.find_any(aid)
+        if acc and store.remove_account(acc.provider, aid):
+            deleted += 1
+    return {"deleted": deleted}
+
+
+# ── 编辑账号 ─────────────────────────────────────────────────────────────────
+@router.put("/accounts/{account_id}")
+async def edit_account(account_id: str, payload: dict = Body(...)):
+    core = _core()
+    if core:
+        return await _call_core(core.edit_account(account_id, payload))
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    if "name" in payload and payload["name"]:
+        acc.name = payload["name"].strip()
+    secret = payload.get("token") or payload.get("secret")
+    if secret:
+        secret = secret.strip()
+        acc.mode = "jwt" if (secret.count(".") == 2 and acc.provider == "zai") else "apiKey"
+        acc.jwt_token = secret if acc.mode == "jwt" else None
+        acc.api_key = None if acc.mode == "jwt" else secret
+        acc.status = Status.ACTIVE
+        acc.last_error = None
+    store.update_account(acc)
+    return {"ok": True}
+
+
+# ── 启用 / 禁用 ──────────────────────────────────────────────────────────────
+@router.post("/accounts/{account_id}/enabled")
+async def set_enabled(account_id: str, payload: dict = Body(...)):
+    core = _core()
+    if core:
+        return await _call_core(core.set_enabled(account_id, bool(payload.get("enabled", True))))
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    enabled = bool(payload.get("enabled", True))
+    store.set_enabled(acc.provider, account_id, enabled)
+    return {"ok": True}
+
+
+# ── 刷新额度（实时用量监控）─────────────────────────────────────────────────
+@router.post("/accounts/refresh")
+async def refresh(payload: dict = Body(default=None)):
+    payload = payload or {}
+    core = _core()
+    if core:
+        return await _call_core(core.refresh())
+    if payload.get("all"):
+        targets = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
+    else:
+        ids = set(payload.get("ids") or [])
+        targets = [a for a in store.list_accounts() if a.id in ids and a.mode == "jwt"]
+    summary = await refresh_accounts(targets)
+    return {"summary": summary, "count": len(targets)}
+
+
+@router.post("/accounts/{account_id}/refresh")
+async def refresh_one(account_id: str):
+    core = _core()
+    if core:
+        return await _call_core(core.refresh(account_id))
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    if acc.mode != "jwt":
+        return {"ok": False, "message": "仅 Coding Plan (JWT) 账号支持额度查询"}
+    res = await fetch_quota(acc)
+    return {"ok": "error" not in res, "result": res, "account": acc.public_view()}
+
+
+# ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
+@router.post("/login/start")
+async def login_start():
+    """发起 Z.AI OAuth，返回授权链接供前端展示。"""
+    core = _core()
+    if core:
+        result = await _call_core(core.oauth_start("zai", settings.CORE_OAUTH_REDIRECT_URI))
+        return {"flow_id": result["flowId"], "authorize_url": result["authorizeUrl"], "status": "pending"}
+    flow = ZaiAuthFlow()
+    try:
+        flow_id, authorize_url = await flow.init()
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(502, f"登录初始化失败: {err}")
+    _login_flows[flow_id] = flow
+    return {"flow_id": flow_id, "authorize_url": authorize_url}
+
+
+@router.get("/login/poll/{flow_id}")
+async def login_poll(flow_id: str):
+    """轮询授权状态；成功后自动兑换凭证并加入账号池。"""
+    core = _core()
+    if core:
+        return await _call_core(core.oauth_status(flow_id))
+    flow = _login_flows.get(flow_id)
+    if not flow:
+        raise HTTPException(404, "登录会话不存在或已过期")
+    try:
+        data = await flow.poll(flow_id)
+    except Exception:  # noqa: BLE001 - 单次网络抖动按 pending 处理
+        return {"status": "pending"}
+
+    state = data.get("status")
+    if state == "failed":
+        _login_flows.pop(flow_id, None)
+        return {"status": "failed"}
+    if state != "ready":
+        return {"status": "pending"}
+
+    # 授权成功：保存 Coding Plan JWT，并尝试兑换 API Key 作为同账号回退
+    zcode_jwt = data.get("token")
+    access_token = (data.get("zai") or {}).get("access_token")
+    account = None
+    if zcode_jwt:
+        account = store.add_account("zai", "oauth-login", zcode_jwt)
+    if access_token:
+        try:
+            api_key = await flow.exchange_api_key(access_token)
+            if account is not None:
+                account.api_key = api_key
+                store.update_account(account)
+            else:
+                account = store.add_account("zai", "oauth-login", api_key)
+        except Exception:  # noqa: BLE001 - 兑换失败不影响 JWT 已入池
+            pass
+
+    _login_flows.pop(flow_id, None)
+    if account is None:
+        return {"status": "failed", "message": "未能从授权结果中获取凭证"}
+
+    if account.mode == "jwt":
+        await refresh_accounts([account])
+    return {"status": "ready", "account": account.public_view()}
+
+
+@oauth_callback_router.get("/login/callback/{flow_id}", include_in_schema=False)
+async def oauth_callback(flow_id: str, request: Request):
+    """OAuth 提供商回调中继：浏览器回调到面板，再由面板转发给核心。"""
+    if not settings.CORE_ENABLED:
+        return HTMLResponse("OAuth core relay is disabled.", status_code=404)
+    code = request.query_params.get("authCode") or request.query_params.get("code") or ""
+    state = request.query_params.get("state") or ""
+    if not code or not state:
+        return HTMLResponse("授权回调缺少 code 或 state，请关闭页面并重试。", status_code=400)
+    try:
+        result = await _call_core(_core().oauth_callback(flow_id, code, state))
+    except HTTPException as error:
+        return HTMLResponse("核心 OAuth 处理失败：" + str(error.detail), status_code=502)
+    if result.get("status") == "ready":
+        return HTMLResponse("授权成功，账号已进入核心账号池。可以关闭此页面并返回控制面板。")
+    return HTMLResponse("授权未完成：" + str(result.get("error") or result.get("status") or "unknown"), status_code=400)
+
+
+# ── 设置 ─────────────────────────────────────────────────────────────────────
+@router.get("/settings")
+async def get_settings():
+    if settings.CORE_ENABLED:
+        return {
+            "core_enabled": True,
+            "core_url": settings.CORE_URL,
+            "gateway_key": "已由核心管理",
+            "admin_key": "已由面板环境管理",
+            "quota_refresh_interval": 0,
+        }
+    return {
+        "admin_key": store.admin_key(),
+        "gateway_key": store.gateway_key(),
+        "quota_refresh_interval": store.quota_refresh_interval(),
+    }
+
+
+@router.put("/settings")
+async def update_settings(payload: dict = Body(...)):
+    if settings.CORE_ENABLED:
+        raise HTTPException(409, "核心模式的连接与密钥由面板环境变量管理")
+    if "admin_key" in payload:
+        key = (payload["admin_key"] or "").strip()
+        if not key:
+            raise HTTPException(400, "后台密钥不能为空")
+        store.set_setting("admin_key", key)
+    if "gateway_key" in payload:
+        store.set_setting("gateway_key", (payload["gateway_key"] or "").strip())
+    if "quota_refresh_interval" in payload:
+        try:
+            interval = max(0, int(payload["quota_refresh_interval"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "刷新间隔必须是非负整数")
+        store.set_setting("quota_refresh_interval", str(interval))
+    return {"ok": True}
+
+
+# ── 导入 / 导出 ─────────────────────────────────────────────────────────────
+@router.get("/export")
+async def export_accounts():
+    if settings.CORE_ENABLED:
+        raise HTTPException(409, "核心模式禁止从面板导出凭据")
+    return store.export()
+
+
+@router.post("/import")
+async def import_accounts(payload: dict = Body(...)):
+    if settings.CORE_ENABLED:
+        raise HTTPException(409, "核心模式禁止向面板本地账号池导入凭据")
+    count = store.import_accounts(payload)
+    return {"count": count}

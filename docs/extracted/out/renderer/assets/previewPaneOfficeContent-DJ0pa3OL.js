@@ -1,0 +1,1 @@
+import{t as e}from"./previewPaneOfficeContent-fEuv_RSH.js";export{e as PreviewPaneOfficeContent};

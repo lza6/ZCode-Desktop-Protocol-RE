@@ -1,0 +1,1 @@
+import{n as e,t}from"./square-DcB6Fraj.js";export{e as __iconNode,t as default};

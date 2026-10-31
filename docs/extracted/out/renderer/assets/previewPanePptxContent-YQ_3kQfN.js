@@ -1,0 +1,1 @@
+import{t as e}from"./previewPanePptxContent-4lAjTmPz.js";export{e as PptxPreviewContent};

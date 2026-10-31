@@ -1,0 +1,7 @@
+bin/
+config.local*.json
+*.local.json
+device.key
+__pycache__/
+
+.codegraph

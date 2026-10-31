@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="shortcut icon" href="favicon.ico">
+<link rel="icon" href="favicon.ico" type="image/x-icon" sizes="any">
+<link rel="icon" href="favicon-32x32.png" type="image/png" sizes="32x32">
+<link rel="icon" href="favicon-16x16.png" type="image/png" sizes="16x16">
+<link rel="apple-touch-icon" href="apple-icon.png">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glm-zcode-2api · Turn your ZCode plan into an OpenAI-compatible API</title>
+<meta name="description" content="A local reverse proxy that turns your ZCode plan into an OpenAI-compatible API — zero credential copying, tool loops and thinking effort fully preserved.">
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#11161d; --panel2:#0e1319; --line:#1f2733;
+    --text:#e6edf3; --muted:#8b98a5; --accent:#5b9dff; --accent2:#8b7bff;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--text);font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre{font-family:var(--mono)}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+  header.site{position:sticky;top:0;z-index:10;backdrop-filter:blur(10px);background:rgba(11,15,20,.82);border-bottom:1px solid var(--line)}
+  header.site .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .logo{display:flex;align-items:center;gap:9px;font-weight:700;font-size:17px;letter-spacing:.2px;color:var(--text)}
+  .logo img{display:block;border-radius:7px}
+  .logo span{color:var(--text)}
+  header.site nav{margin-left:auto;display:flex;gap:18px;font-size:14.5px;align-items:center}
+  header.site nav a{color:var(--muted)}
+  header.site nav a:hover{color:var(--text);text-decoration:none}
+  .lang{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .lang button{background:none;border:none;color:var(--muted);font:inherit;font-size:13px;padding:4px 10px;cursor:pointer}
+  .lang button.active{background:var(--panel);color:var(--text)}
+  html[data-lang="en"] [data-l="zh"]{display:none!important}
+  html[data-lang="zh"] [data-l="en"]{display:none!important}
+  .hero{padding:92px 0 60px;text-align:center;background:
+    radial-gradient(600px 260px at 50% -60px,rgba(91,157,255,.16),transparent 70%),
+    radial-gradient(520px 240px at 78% 10%,rgba(139,123,255,.10),transparent 70%)}
+  .hero h1{font-size:42px;line-height:1.18;letter-spacing:-.5px}
+  .hero h1 .grad{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .hero p.sub{color:var(--muted);font-size:18px;margin:22px auto 30px;max-width:760px}
+  .badges{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:36px}
+  .badge{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:4px 13px;font-size:13px;color:var(--muted)}
+  .badge b{color:var(--text);font-weight:600}
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+  .btn{display:inline-block;padding:11px 22px;border-radius:10px;font-size:15.5px;font-weight:600;border:1px solid var(--line)}
+  .btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent2));border:none;color:#fff}
+  .btn.primary:hover{filter:brightness(1.1);text-decoration:none}
+  .btn.ghost{color:var(--text)}
+  .btn.ghost:hover{border-color:var(--accent);text-decoration:none}
+  h2{font-size:25px;margin:0 0 22px;letter-spacing:-.3px}
+  section{padding:52px 0}
+  section.alt{background:var(--panel2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .diagram{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:26px 20px;display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;font-size:14px}
+  .node{border:1px solid var(--line);background:var(--panel2);border-radius:10px;padding:12px 16px;text-align:center;min-width:150px}
+  .node b{display:block;font-size:14.5px}
+  .node small{color:var(--muted);font-size:12.5px;line-height:1.5;display:block;margin-top:3px}
+  .node.gw{border-color:#2b3b52;background:linear-gradient(180deg,#131c28,#101720);min-width:260px}
+  .arrow{color:var(--accent);font-size:20px;font-family:var(--mono)}
+  .arrow.dash{color:#41506a}
+  pre{background:#0a0e13;border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;font-size:13.5px;line-height:1.75;color:#c9d6e4}
+  pre .c{color:#5c6b7a}
+  pre .p{color:#3fb950;user-select:none}
+  .chips{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;display:flex;gap:8px;flex-wrap:wrap;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+  .step{margin-bottom:26px}
+  .step h3{font-size:15.5px;color:var(--text);font-weight:600;margin-bottom:10px}
+  .step .hint{color:var(--muted);font-size:13.5px;margin:0 0 10px}
+  .step pre{margin:0}
+  .prompt{position:relative;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:12px;padding:16px 18px}
+  .prompt-text{color:var(--text);font-size:14.5px;line-height:1.8;margin:0}
+  .copy{position:absolute;top:10px;right:10px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--muted);font:inherit;font-size:12.5px;padding:5px 12px;cursor:pointer}
+  .copy:hover{border-color:var(--accent);color:var(--text)}
+  pre .tok-c{color:#5c6b7a}
+  pre .tok-s{color:#a5c8ff}
+  pre .tok-k{color:#8bd5a0}
+  pre .tok-f{color:#d2b48c}
+  pre .tok-b{color:#7ee2a8}
+  footer{border-top:1px solid var(--line);padding:34px 0 44px;color:var(--muted);font-size:13.5px}
+  footer .wrap{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap}
+  @media(max-width:640px){.hero h1{font-size:33px}section{padding:42px 0}}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <div class="logo"><img src="logo.svg" width="26" height="26" alt=""><span>glm-zcode-2api</span></div>
+    <nav>
+      <a href="https://github.com/binggao1230/glm-zcode-2api">GitHub</a>
+      <span class="lang">
+        <button class="lang-btn" data-set="zh" onclick="setLang('zh')">中文</button>
+        <button class="lang-btn" data-set="en" onclick="setLang('en')">EN</button>
+      </span>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <div data-l="zh">
+      <h1>是时候摆脱 <span class="grad">ZCode 客户端</span>了</h1>
+      <p class="sub">本地原生的反向代理：跑在你自己的机器上，凭据不外流，开箱即用；闲时积分优惠与套餐权益照常生效，可用模型随套餐而定。</p>
+      <div class="cta">
+        <a class="btn primary" href="#start">快速开始</a>
+        <a class="btn ghost" href="https://github.com/binggao1230/glm-zcode-2api">GitHub 仓库 →</a>
+      </div>
+    </div>
+    <div data-l="en">
+      <h1>Time to <span class="grad">ditch the ZCode client</span></h1>
+      <p class="sub">A local-native proxy: it runs on your own machine and talks to your ZCode plan directly — out of the box, credentials never leave it. Off-peak perks and plan entitlements included; models follow your plan.</p>
+      <div class="cta">
+        <a class="btn primary" href="#start">Quick Start</a>
+        <a class="btn ghost" href="https://github.com/binggao1230/glm-zcode-2api">GitHub repo →</a>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge"><b>MIT</b> License</span>
+      <span class="badge"><b>Go</b> stdlib only</span>
+      <span class="badge">single binary</span>
+      <span class="badge">macOS / Linux / Windows</span>
+    </div>
+  </div>
+</div>
+
+<section id="start" class="alt">
+  <div class="wrap">
+    <h2 data-l="zh">快速开始</h2><h2 data-l="en">Quick Start</h2>
+
+    <div class="step" data-l="zh">
+      <h3>0 · 交给 AI（推荐）</h3>
+      <p class="hint">把下面这段话复制后发给任何 AI 编码代理（OMP / Claude Code / Cursor 等），它会自动完成安装、启动与 OMP 接入：</p>
+      <div class="prompt">
+        <p class="prompt-text">请阅读 https://github.com/binggao1230/glm-zcode-2api/blob/main/AI_SETUP.md —— 这是 glm-zcode-2api 的自动安装与配置文档，glm-zcode-2api 是一个把本机 ZCode 订阅变成 OpenAI 兼容 API 的网关。请严格按文档执行：克隆并构建项目、启动网关、验证健康状态、把它接入 OMP（oh-my-pi），最后用 omp models zcode 和 omp --model zcode/glm-5.3-flash 验收，并逐步报告每一步的结果。过程中不得提交或打印任何真实凭据。</p>
+        <button class="copy" onclick="copyPrompt(this)" data-done="已复制">复制提示词</button>
+      </div>
+    </div>
+
+    <div class="step" data-l="en">
+      <h3>0 · Let an AI do it (recommended)</h3>
+      <p class="hint">Copy the paragraph below into any AI coding agent (OMP / Claude Code / Cursor etc.) — it installs, starts and wires everything into OMP:</p>
+      <div class="prompt">
+        <p class="prompt-text">Read https://github.com/binggao1230/glm-zcode-2api/blob/main/AI_SETUP.md — it is the install &amp; configuration doc for glm-zcode-2api, a gateway that turns a local ZCode plan into an OpenAI-compatible API. Follow it exactly: clone and build the project, start the gateway, verify its health, integrate it into OMP (oh-my-pi), then verify with omp models zcode and omp --model zcode/glm-5.3-flash, reporting each step's result along the way. Never commit or print real credentials.</p>
+        <button class="copy" onclick="copyPrompt(this)" data-done="Copied">Copy prompt</button>
+      </div>
+    </div>
+
+    <div class="step" data-l="zh">
+      <h3>1 · 安装并启动</h3>
+      <p class="hint">前置条件：本机已登录 ZCode 桌面版 · Go ≥ 1.22（构建）· Python 3（启动器）</p>
+<pre data-lang="bash">git clone https://github.com/binggao1230/glm-zcode-2api
+cd glm-zcode-2api
+
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/glm-zcode-2api ./cmd/server
+
+# 读取 ZCode 配置、生成访问口令、后台常驻
+python3 scripts/omp-gateway.py start
+
+curl -s http://127.0.0.1:7864/healthz
+# {"service":"glm-zcode-2api","healthy":true,...}</pre>
+    </div>
+
+    <div class="step" data-l="en">
+      <h3>1 · Install &amp; run</h3>
+      <p class="hint">Prerequisites: ZCode desktop signed in · Go ≥ 1.22 (build) · Python 3 (launcher)</p>
+<pre data-lang="bash">git clone https://github.com/binggao1230/glm-zcode-2api
+cd glm-zcode-2api
+
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/glm-zcode-2api ./cmd/server
+
+# reads the ZCode config, mints the token, daemonizes
+python3 scripts/omp-gateway.py start
+
+curl -s http://127.0.0.1:7864/healthz
+# {"service":"glm-zcode-2api","healthy":true,...}</pre>
+    </div>
+
+    <div class="step" data-l="zh">
+      <h3>2 · 验证</h3>
+<pre data-lang="bash">KEY=$(python3 scripts/omp-gateway.py token)
+
+curl -sN http://127.0.0.1:7864/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"&lt;套餐内模型&gt;","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+data: {"choices":[{"delta":{"reasoning_content":"…"}}]}
+data: {"choices":[{"delta":{"content":"你好！"}}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+data: [DONE]</pre>
+    </div>
+
+    <div class="step" data-l="en">
+      <h3>2 · Verify</h3>
+<pre data-lang="bash">KEY=$(python3 scripts/omp-gateway.py token)
+
+curl -sN http://127.0.0.1:7864/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"&lt;a model from your plan&gt;","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+data: {"choices":[{"delta":{"reasoning_content":"…"}}]}
+data: {"choices":[{"delta":{"content":"Hi there!"}}]}
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+data: [DONE]</pre>
+    </div>
+
+    <div class="step" data-l="zh">
+      <h3>3 · 接入 OMP（oh-my-pi）</h3>
+<pre data-lang="yaml"># ~/.omp/agent/models.yml
+zcode:
+  baseUrl: http://127.0.0.1:7864/v1
+  api: openai-completions
+  apiKey: '!/usr/bin/python3 ~/projects/glm-zcode-2api/scripts/omp-gateway.py token'
+  authHeader: true
+  compat:
+    supportsStore: false
+    supportsDeveloperRole: false
+    maxTokensField: max_tokens
+  models:
+  # 模型以套餐实际提供为准，按需增删
+  - id: glm-5.3
+    name: ZCode / GLM-5.3
+    reasoning: true
+    input: [text]
+    contextWindow: 1000000
+    maxTokens: 128000</pre>
+      <p class="hint"><code>apiKey</code> 指向取口令命令而非固定密钥——OMP 解析该 provider 时若网关未运行会自动拉起（≤2s），无需常驻。</p>
+    </div>
+
+    <div class="step" data-l="en">
+      <h3>3 · Wire up OMP (oh-my-pi)</h3>
+<pre data-lang="yaml"># ~/.omp/agent/models.yml
+zcode:
+  baseUrl: http://127.0.0.1:7864/v1
+  api: openai-completions
+  apiKey: '!/usr/bin/python3 ~/projects/glm-zcode-2api/scripts/omp-gateway.py token'
+  authHeader: true
+  compat:
+    supportsStore: false
+    supportsDeveloperRole: false
+    maxTokensField: max_tokens
+  models:
+  # list the models your plan actually provides
+  - id: glm-5.3
+    name: ZCode / GLM-5.3
+    reasoning: true
+    input: [text]
+    contextWindow: 1000000
+    maxTokens: 128000</pre>
+      <p class="hint"><code>apiKey</code> points at the token-printing command, not a fixed secret — OMP starts the gateway on demand (≤2s) when resolving this provider; no daemon required.</p>
+    </div>
+
+    <div class="step" data-l="zh">
+      <h3>管理命令</h3>
+<pre data-lang="bash">python3 scripts/omp-gateway.py status    # 运行状态 + health
+python3 scripts/omp-gateway.py restart   # 重新登录 ZCode / 切换套餐后同步
+python3 scripts/omp-gateway.py stop
+python3 scripts/omp-gateway.py token     # 打印访问口令
+python3 scripts/omp-gateway.py usage     # 实时套餐额度</pre>
+    </div>
+
+    <div class="step" data-l="en">
+      <h3>Management commands</h3>
+<pre data-lang="bash">python3 scripts/omp-gateway.py status    # runtime status + health
+python3 scripts/omp-gateway.py restart   # after re-logging into ZCode
+python3 scripts/omp-gateway.py stop
+python3 scripts/omp-gateway.py token     # print the access token
+python3 scripts/omp-gateway.py usage    # live plan meter</pre>
+    </div>
+  </div>
+</section>
+
+<section id="arch">
+  <div class="wrap">
+    <h2 data-l="zh">架构</h2><h2 data-l="en">Architecture</h2>
+    <div class="diagram">
+      <div class="node"><b data-l="zh">OMP / 任意客户端</b><b data-l="en">OMP / any client</b><small>OpenAI<br>127.0.0.1:7864 / LAN</small></div>
+      <div class="arrow">→</div>
+      <div class="node gw"><b>glm-zcode-2api</b><small data-l="zh">鉴权 · 体积上限<br>OpenAI ⇄ Anthropic 转换<br>签名思考回放缓存</small><small data-l="en">auth · body limit<br>OpenAI ⇄ Anthropic translation<br>signed-thinking replay cache</small></div>
+      <div class="arrow">→</div>
+      <div class="node"><b>Coding Plan upstream</b><small>Anthropic Messages (SSE)</small></div>
+    </div>
+    <div class="diagram" style="margin-top:12px;border-style:dashed">
+      <span class="arrow dash">⇢</span>
+      <div class="node" style="border-style:dashed"><b>~/.zcode/v2/config.json</b><small data-l="zh">网关只读：apiKey + baseURL<br>凭据不复制、App 文件不改写</small><small data-l="en">read-only: apiKey + baseURL<br>nothing copied, app files untouched</small></div>
+      <span style="color:var(--muted);font-size:13px" data-l="zh">凭据只在这台机器上流转</span>
+      <span style="color:var(--muted);font-size:13px" data-l="en">credentials never leave this machine</span>
+    </div>
+  </div>
+</section>
+
+<section id="attribution" class="alt">
+  <div class="wrap">
+    <h2 data-l="zh">闲时优惠，与 App 同权</h2><h2 data-l="en">Off-peak discounts, same treatment as the app</h2>
+    <p style="color:var(--muted);max-width:860px;margin-bottom:18px" data-l="zh">GLM Coding Plan 按积分计费，<strong>非高峰时段（含周末全天）调用只消耗 50% 标准积分</strong>。这类权益在 ZCode <strong>平台网关</strong>（<code>zcode.z.ai/api/v1/ultra/…</code>）校验——官方客户端也会把请求重写到这里。网关默认走同一条路径，并发送与 App 相同的归因材料：</p>
+    <p style="color:var(--muted);max-width:860px;margin-bottom:18px" data-l="en">The GLM Coding Plan is credit-based: <strong>off-peak calls (weekends included) consume only 50% of standard credits</strong>. These perks are validated at the ZCode <strong>platform gateway</strong> (<code>zcode.z.ai/api/v1/ultra/…</code>) — the official client rewrites its requests there too. The gateway follows the same path by default and sends the same attribution material:</p>
+    <div class="chips">
+      <span>user-agent: ZCode/3.14.1</span><span>·</span>
+      <span>x-zcode-agent: glm</span><span>·</span>
+      <span>http-referer: zcode.z.ai</span><span>·</span>
+      <span>x-os-version: 27.0.0</span><span>·</span>
+      <span>x-device-mid: &lt;device id&gt;</span><span>·</span>
+      <span>metadata.user_id: {"device_id":…,"session_id":…}</span>
+    </div>
+    <p style="color:var(--muted);font-size:13.5px;margin-top:12px" data-l="zh">版本号自动读取 ZCode.app，设备 ID 首次生成后持久化，时区默认探测本机（可用 <code>upstream.client_timezone</code> 指定）；鉴权使用套餐 <code>x-api-key</code>（实测加发 <code>Authorization</code> 会按更高档计费，已移除）。<code>upstream.gateway_origin</code> 置空可改为直连模型服务。</p>
+    <p style="color:var(--muted);font-size:13.5px;margin-top:12px" data-l="en">The version is read from ZCode.app's Info.plist, the device id is generated once and persisted, and the timezone is detected from the host (override with <code>upstream.client_timezone</code>). Auth uses the plan <code>x-api-key</code> (measured: sending an extra <code>Authorization</code> header is billed at a higher tier — removed). Set <code>upstream.gateway_origin</code> empty to call the provider directly.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>MIT License · © 2026 glm-zcode-2api contributors</div>
+    <div><a href="https://github.com/binggao1230/glm-zcode-2api">GitHub</a></div>
+  </div>
+</footer>
+
+<script>
+  var LANG_KEY = 'z2a-lang-v2'; // new key: old visitors' stored 'zh' must not override the EN default
+  function highlight(root){
+    const esc = (t) => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    root.querySelectorAll('pre[data-lang]').forEach(function(pre){
+      const lang = pre.dataset.lang;
+      let src = esc(pre.textContent);
+      const stash = [], keep = (html) => '\u0000' + (stash.push(html) - 1) + '\u0000';
+      src = src.replace(/'[^'\n]*'|"[^"\n]*"/g, (m) => keep('<span class="tok-s">' + m + '</span>'));
+      src = src.replace(/(^|\s)(#[^\n]*)/g, (m, a, b) => a + keep('<span class="tok-c">' + b + '</span>'));
+      if (lang === 'yaml') {
+        src = src.replace(/^([ \t-]*)([A-Za-z0-9_./-]+)(:)/gm, (m, a, b, c) => a + keep('<span class="tok-k">' + b + '</span>') + c);
+      } else {
+        src = src.replace(/(\s)(--?[A-Za-z][\w-]*)/g, (m, a, b) => a + keep('<span class="tok-f">' + b + '</span>'));
+        src = src.replace(/^([ \t]*)([A-Za-z][\w.-]*)/gm, (m, a, b) => a + keep('<span class="tok-b">' + b + '</span>'));
+      }
+      pre.innerHTML = src.replace(/\u0000(\d+)\u0000/g, (m, i) => stash[+i]);
+    });
+  }
+  function copyPrompt(btn){
+    const text = btn.closest('.prompt').querySelector('.prompt-text').textContent.trim();
+    const done = () => {
+      const label = btn.dataset.done || 'Copied';
+      const old = btn.textContent;
+      btn.textContent = label;
+      setTimeout(() => { btn.textContent = old; }, 1600);
+    };
+    const fallback = () => {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      ta.remove(); done();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else { fallback(); }
+  }
+  function setLang(l){
+    document.documentElement.dataset.lang = l;
+    try{ localStorage.setItem(LANG_KEY, l); }catch(e){}
+    document.querySelectorAll('.lang-btn').forEach(function(b){
+      b.classList.toggle('active', b.dataset.set === l);
+    });
+  }
+  (function(){
+    var saved = 'en';
+    try{ saved = localStorage.getItem(LANG_KEY) || 'en'; }catch(e){}
+    setLang(saved);
+    highlight(document);
+  })();
+</script>
+
+</body>
+</html>

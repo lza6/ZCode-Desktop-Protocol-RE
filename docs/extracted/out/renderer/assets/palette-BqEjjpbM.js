@@ -1,0 +1,1 @@
+import{n as e,t}from"./palette-DJk7jsHP.js";export{e as __iconNode,t as default};

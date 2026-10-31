@@ -1,0 +1,871 @@
+// Panel account onboarding: Google OAuth for the antigravity channel and the
+// WorkBuddy device flow, both driven from the browser.
+//
+// Google: a loopback authorization-code flow. The listener binds 127.0.0.1
+// only and is closed after the callback or the 5-minute deadline; our own
+// state nonce keys the pending flow. client_id/client_secret come from
+// config.json only (never hardcoded here); authorization codes and tokens
+// never reach logs.
+//
+// WorkBuddy: device authorization. Endpoint and envelope semantics are
+// re-implemented from the MIT-licensed workbuddy2api-panel reference (see
+// NOTICE); the upstream state keys an in-memory flow that is never persisted.
+// The realm is fixed at start and re-checked at poll (防混域).
+package panel
+
+import (
+	"bargainproxy/internal/safego"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"bargainproxy/internal/config"
+	"bargainproxy/internal/driver/workbuddy"
+	"bargainproxy/internal/model"
+)
+
+const (
+	// oauthFlowTTL bounds how long a start→callback/poll cycle may take.
+	oauthFlowTTL = 5 * time.Minute
+	// googleAuthEndpoint is Google's authorization-code endpoint.
+	googleAuthEndpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+	// googleOAuthScope matches the Cloud Code Assist client scopes.
+	googleOAuthScope = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
+)
+
+// wbRealmOf derives the realm from the front-host origin (workbuddy.ai is
+// the only global front).
+func wbRealmOf(origin string) string {
+	if strings.Contains(origin, "workbuddy.ai") {
+		return "global"
+	}
+	return "cn"
+}
+
+// wbRandomHex32 is the login endpoints' X-Request-ID: pure-random 32 hex with
+// no millisecond prefix (BP-225, misakano 96b816da).
+func wbRandomHex32() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%016x%016x", time.Now().UnixNano(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// builtinGoogleClientID/builtinGoogleClientSecret now come from
+// internal/config (shared with the antigravity driver's refresh path);
+// kept as vars so the oauth.go call sites stay unchanged.
+var builtinGoogleClientID, builtinGoogleClientSecret = config.GoogleOAuthFallback()
+
+// authFlow is one pending onboarding attempt.
+type authFlow struct {
+	channel   string
+	realm     string // workbuddy only
+	state     string // google only: the nonce bound into the authorize URL
+	status    string // pending | success | failed
+	accountID string
+	errMsg    string
+	expiresAt time.Time
+	// created is the flow's birthday: touchFlow slides expiresAt on active
+	// polls but never past created+flowMaxLifetime (BP-51).
+	created     time.Time
+	persistedAt time.Time    // last sealed write (throttles poll-driven re-persist)
+	server      *http.Server // google loopback listener (closed on finish/expiry)
+	// wbState is the WorkBuddy upstream state (device flow). Kept separate from
+	// state (the Google nonce) because the account lookup needs it on every poll.
+	wbState string
+	// tok is the device-flow token once the upstream has issued it. The token
+	// is single-issue: it must survive across polls (2026-10-21 field bug).
+	tok *wbToken
+	// traeDevice carries the machine/device ids generated at Trae flow start:
+	// the login URL was built from them, and the credential blob must store
+	// the same pair (BP-98 TRAE-2 — they used to be written as "").
+	traeDevice *traeFlowDevice
+}
+
+// wbToken is the WorkBuddy device-flow token triplet.
+type wbToken struct {
+	access    string
+	refresh   string
+	expiresIn int64
+	domain    string
+}
+
+func (p *Panel) putFlow(key string, f *authFlow) {
+	p.flowMu.Lock()
+	now := time.Now()
+	if f.created.IsZero() {
+		f.created = now
+	}
+	var dropped []string
+	for k, old := range p.flows {
+		if now.After(old.expiresAt) {
+			shutdownServerAsync(old.server)
+			delete(p.flows, k)
+			dropped = append(dropped, k)
+		}
+	}
+	p.flows[key] = f
+	p.flowMu.Unlock()
+	for _, k := range dropped {
+		p.dropPersistedFlow(k)
+	}
+	p.persistFlow(key)
+}
+
+func (p *Panel) getFlow(key string) (authFlow, bool) {
+	p.flowMu.Lock()
+	defer p.flowMu.Unlock()
+	f := p.flows[key]
+	if f == nil || time.Now().After(f.expiresAt) {
+		return authFlow{}, false
+	}
+	return *f, true
+}
+
+// finishFlow marks a flow terminal (success/failed) and releases its loopback
+// listener. Later polls keep reading the terminal state.
+func (p *Panel) finishFlow(key, status, accountID, errMsg string) {
+	p.flowMu.Lock()
+	f := p.flows[key]
+	if f != nil {
+		f.status = status
+		f.accountID = accountID
+		f.errMsg = errMsg
+		shutdownServerAsync(f.server)
+	}
+	p.flowMu.Unlock()
+	// Terminal states are persisted too: a poll after a restart still answers
+	// success/failed instead of "会话不存在" (BP-51).
+	p.persistFlow(key)
+}
+
+func (p *Panel) expireFlow(key string) { p.expireFlowAt(key, time.Time{}) }
+
+// expireFlowAt fails the flow once its (sliding) expiry passes. The original
+// implementation fired blindly oauthFlowTTL after start: a user who needed
+// more than five minutes in the browser (password, verification) got
+// 等待授权超时 even though the upstream had already issued the token — and
+// unlike a token loss, that failure is final. The timer now re-arms while the
+// flow's expiry keeps sliding (active polls, bounded by flowMaxLifetime) and
+// only fires when the flow is genuinely expired (misakano parity, field
+// report 2026-10-22).
+func (p *Panel) expireFlowAt(key string, created time.Time) {
+	p.flowMu.Lock()
+	f := p.flows[key]
+	if f == nil {
+		p.flowMu.Unlock()
+		return
+	}
+	if f.status != "pending" {
+		p.flowMu.Unlock()
+		return
+	}
+	expiry := f.expiresAt
+	born := f.created
+	if born.IsZero() {
+		born = created
+	}
+	p.flowMu.Unlock()
+	if wait := time.Until(expiry); wait > 0 {
+		time.AfterFunc(wait+time.Second, func() { p.expireFlowAt(key, born) })
+		return
+	}
+	// Expiry has passed — but only fail if no poll slid it forward in the
+	// meantime (touchFlow updates expiresAt under the same lock).
+	p.flowMu.Lock()
+	f = p.flows[key]
+	still := f != nil && f.status == "pending" && !time.Now().Before(f.expiresAt)
+	p.flowMu.Unlock()
+	if still {
+		p.finishFlow(key, "failed", "", "等待授权超时，请重新发起")
+	}
+}
+
+// shutdownServerAsync gracefully stops a loopback listener. Close (not
+// Shutdown) would cut the connection that is still writing the callback page.
+func shutdownServerAsync(hs *http.Server) {
+	if hs == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = hs.Shutdown(ctx)
+	}()
+}
+
+// --- Google OAuth (antigravity) ---
+
+func (p *Panel) handleGoogleStart(w http.ResponseWriter, r *http.Request) {
+	ag := p.cfg.Channels.Antigravity
+	// Explicit config values win; otherwise fall back to Google's public CLI
+	// client so panel onboarding works out of the box (matches the
+	// AIClient2API reference behavior the operator expects).
+	clientID, clientSecret := ag.GoogleOAuthClientID, ag.GoogleOAuthClientSecret
+	if clientID == "" || clientSecret == "" {
+		clientID, clientSecret = builtinGoogleClientID, builtinGoogleClientSecret
+	}
+	if clientID == "" || clientSecret == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "google oauth client id/secret not configured in config.json",
+		})
+		return
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": "loopback listener failed: " + err.Error(),
+		})
+		return
+	}
+	state := randHex(16)
+	redirectURI := "http://" + ln.Addr().String() + "/oauth2callback"
+	key := "g:" + state
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth2callback", func(cw http.ResponseWriter, cr *http.Request) {
+		p.handleGoogleCallback(cw, cr, key, redirectURI)
+	})
+	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = hs.Serve(ln) }()
+	p.putFlow(key, &authFlow{
+		channel: model.ChannelAntigravity, state: state, status: "pending",
+		expiresAt: time.Now().Add(oauthFlowTTL), server: hs,
+	})
+	time.AfterFunc(oauthFlowTTL, func() { p.expireFlowAt(key, time.Now()) })
+
+	q := url.Values{
+		"client_id":     {clientID},
+		"redirect_uri":  {redirectURI},
+		"response_type": {"code"},
+		"scope":         {googleOAuthScope},
+		"access_type":   {"offline"},
+		"prompt":        {"consent"},
+		"state":         {state},
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authorize_url": googleAuthEndpoint + "?" + q.Encode(),
+		"state":         state,
+	})
+}
+
+func (p *Panel) handleGoogleCallback(w http.ResponseWriter, r *http.Request, key, redirectURI string) {
+	f, ok := p.getFlow(key)
+	if !ok || f.status != "pending" {
+		writeOAuthPage(w, false, "会话已失效，请回到控制台重新发起")
+		return
+	}
+	// The state nonce must round-trip through Google's redirect: the flow key
+	// alone would let any local process that discovers the loopback port
+	// complete the login with its own code (login CSRF). A mismatch rejects
+	// this one callback but leaves the pending flow untouched, so a stray
+	// probe cannot burn the user's authorization session.
+	if got := r.URL.Query().Get("state"); subtle.ConstantTimeCompare([]byte(got), []byte(f.state)) != 1 {
+		log.Printf("panel: google oauth callback state mismatch (port probe?)")
+		writeOAuthPage(w, false, "授权校验失败（state 不匹配），请回到控制台重新发起")
+		return
+	}
+	if e := r.URL.Query().Get("error"); e != "" {
+		p.finishFlow(key, "failed", "", "授权被拒绝："+e)
+		writeOAuthPage(w, false, "授权失败："+e)
+		return
+	}
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeOAuthPage(w, false, "缺少授权码，请重新发起")
+		return
+	}
+	acc, err := p.googleExchange(r.Context(), code, redirectURI)
+	if err != nil {
+		log.Printf("panel: google oauth exchange failed: %v", err)
+		p.finishFlow(key, "failed", "", "授权码交换失败，请重试")
+		writeOAuthPage(w, false, "授权失败，请回到控制台重试")
+		return
+	}
+	if err := p.store.SaveAccount(acc); err != nil {
+		log.Printf("panel: google oauth save failed: %v", err)
+		p.finishFlow(key, "failed", "", "保存账号失败")
+		writeOAuthPage(w, false, "保存账号失败，请查看服务日志")
+		return
+	}
+	p.gw.Pool().Upsert(acc)
+	p.finishFlow(key, "success", acc.ID, "")
+	writeOAuthPage(w, true, "添加成功，可关闭此页")
+}
+
+func (p *Panel) handleGooglePoll(w http.ResponseWriter, r *http.Request) {
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "state required"})
+		return
+	}
+	f, ok := p.getFlow("g:" + state)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": "授权会话不存在或已过期"})
+		return
+	}
+	writeJSON(w, http.StatusOK, flowStatusJSON(f))
+}
+
+func flowStatusJSON(f authFlow) map[string]any {
+	out := map[string]any{"status": f.status}
+	if f.accountID != "" {
+		out["account_id"] = f.accountID
+	}
+	if f.errMsg != "" {
+		out["error"] = f.errMsg
+	}
+	return out
+}
+
+// googleExchange swaps the authorization code for tokens and reuses the
+// import identity discipline (email first, refresh-token hash fallback).
+func (p *Panel) googleExchange(ctx context.Context, code, redirectURI string) (*model.Account, error) {
+	ag := p.cfg.Channels.Antigravity
+	clientID, clientSecret := ag.GoogleOAuthClientID, ag.GoogleOAuthClientSecret
+	if clientID == "" || clientSecret == "" {
+		clientID, clientSecret = builtinGoogleClientID, builtinGoogleClientSecret
+	}
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"redirect_uri":  {redirectURI},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ag.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := p.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token exchange: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		// Surface only the machine error code; the raw body may echo request
+		// fields and must not be propagated.
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &e)
+		return nil, fmt.Errorf("token exchange: upstream %d (%s)", resp.StatusCode, firstNonEmpty(e.Error, "unknown"))
+	}
+	if rerr != nil {
+		return nil, fmt.Errorf("token exchange: read body: %w", rerr)
+	}
+	var tok struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		IDToken      string `json:"id_token"`
+	}
+	if err := json.Unmarshal(raw, &tok); err != nil || tok.AccessToken == "" {
+		return nil, fmt.Errorf("token exchange: malformed response")
+	}
+	if tok.RefreshToken == "" {
+		return nil, fmt.Errorf("token exchange: no refresh_token in response")
+	}
+	expiry := time.Now().Add(time.Hour)
+	if tok.ExpiresIn > 0 {
+		expiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	}
+	creds, _ := json.Marshal(map[string]any{
+		"access_token":  tok.AccessToken,
+		"refresh_token": tok.RefreshToken,
+		"email":         idTokenEmail(tok.IDToken),
+		"expiry":        expiry.Format(time.RFC3339),
+	})
+	return normalizeImport(model.ChannelAntigravity, creds, "")
+}
+
+// idTokenEmail reads the email claim from an id_token payload. The token came
+// over TLS from the configured token endpoint; the signature is not verified
+// and only feeds the display identity (the refresh-token hash is the stable
+// fallback when absent).
+func idTokenEmail(idToken string) string {
+	parts := strings.Split(idToken, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Email
+}
+
+// writeOAuthPage renders the loopback confirmation page. Dynamic text is
+// HTML-escaped (the Google error query parameter is attacker-controlled).
+func writeOAuthPage(w http.ResponseWriter, ok bool, msg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	color := "#e5534b"
+	if ok {
+		color = "#39c07f"
+	}
+	fmt.Fprintf(w, `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>BargainProxy</title></head>
+<body style="font:15px/1.6 system-ui,sans-serif;background:#0f1115;color:#e6e9ef;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center"><div style="font-size:40px;color:%s">%s</div><p>%s</p></div></body></html>`,
+		color, map[bool]string{true: "✓", false: "✗"}[ok], html.EscapeString(msg))
+}
+
+// --- WorkBuddy device flow ---
+
+// wbBizError is a non-zero business envelope code (used as the pending signal
+// by the token endpoint).
+type wbBizError struct {
+	code int
+	msg  string
+}
+
+func (e *wbBizError) Error() string { return fmt.Sprintf("upstream code %d: %s", e.code, e.msg) }
+
+func (p *Panel) wbRealmBase(realm string) string {
+	if realm == "global" {
+		return p.cfg.Channels.WorkBuddy.ChatBaseGL
+	}
+	return p.cfg.Channels.WorkBuddy.ChatBaseCN
+}
+
+func wbRealmOrigin(realm string) string {
+	if realm == "global" {
+		return "https://www.workbuddy.ai"
+	}
+	// BP-225 (misakano 47f1ed61/96b816da): the CN front host is
+	// www.workbuddy.cn — codebuddy.cn is the pre-rebrand origin no real
+	// request uses. The value rides X-Domain on the login endpoints (the
+	// API base may be copilot.tencent.com; the header declares which FRONT
+	// is calling, not which machine).
+	return "https://www.workbuddy.cn"
+}
+
+// wbLoginUA is the device-flow UA: the REST/RPC family, per realm (BP-225,
+// misakano 96b816da — the old "CLI/2.63.2 CodeBuddy/2.63.2" was a CodeBuddy
+// CLI leftover no current client sends).
+func wbLoginUA(realm string) string {
+	return workbuddy.RestUA(realm == "global")
+}
+
+// wbNoSentinels are the x-no-* sentinels the login endpoints carry. The real
+// value is the string "true", not "1" (BP-225, misakano 96b816da); the
+// unauthorized endpoints send all four, login/account only three (it already
+// has Bearer — the missing one is exactly "no account stored yet").
+func wbNoSentinels(noAuth bool) map[string]string {
+	out := map[string]string{
+		"X-No-User-Id":         "true",
+		"X-No-Enterprise-Id":   "true",
+		"X-No-Department-Info": "true",
+	}
+	if noAuth {
+		out["X-No-Authorization"] = "true"
+	}
+	return out
+}
+
+func (p *Panel) handleWBStart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Realm string `json:"realm"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	realm := req.Realm
+	if realm == "" {
+		realm = "cn"
+	}
+	if realm != "cn" && realm != "global" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "realm must be cn or global"})
+		return
+	}
+	if realm == "global" && !p.wbGlobalEnabled() {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "国际版未开启：先在账号池勾选 WorkBuddy 国际版"})
+		return
+	}
+	base := p.wbRealmBase(realm)
+	if base == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "workbuddy base url not configured"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	// BP-225 (misakano 96b816da): the platform query comes from each
+	// distribution's product.json authentication.attributes.platform — CN
+	// "workbuddy", international "workbuddy-ai". The old "CLI" read the
+	// TOP-LEVEL platform field, which no real client sends. The endpoint
+	// also carries x-domain + x-custom-channel-id + the four x-no-*.
+	platform := "workbuddy"
+	if realm == "global" {
+		platform = "workbuddy-ai"
+	}
+	stateExtra := wbNoSentinels(true)
+	stateExtra["X-Domain"] = strings.TrimPrefix(wbRealmOrigin(realm), "https://")
+	stateExtra["X-Custom-Channel-Id"] = "unknown"
+	data, err := p.wbCall(ctx, http.MethodPost, base+"/v2/plugin/auth/state?platform="+platform, wbRealmOrigin(realm), []byte("{}"), "", stateExtra)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "auth state: " + err.Error()})
+		return
+	}
+	var st struct {
+		State   string `json:"state"`
+		AuthURL string `json:"authUrl"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "auth state: missing state or authUrl"})
+		return
+	}
+	key := "w:" + st.State
+	p.putFlow(key, &authFlow{
+		channel: model.ChannelWorkBuddy, realm: realm, status: "pending",
+		wbState:   st.State,
+		expiresAt: time.Now().Add(oauthFlowTTL),
+	})
+	time.AfterFunc(oauthFlowTTL, func() { p.expireFlowAt(key, time.Now()) })
+	// The panel page polls on its own, but that loop has been observed to
+	// silently stop (2026-10-22: the dialog said 自动检测中 while not a single
+	// poll reached the gateway). Watch from the gateway side too, so a login
+	// completes without depending on the browser tab staying alive.
+	// BP-245: a login watcher is a background job — an unexpected nil in the
+	// upstream flow JSON must not end the process that is serving traffic.
+	go func() { defer safego.Recover("panel.watchWBFlow"); p.watchWBFlow(key) }()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auth_url": st.AuthURL,
+		"state":    st.State,
+		"realm":    realm,
+	})
+}
+
+// watchWBFlow polls the upstream for one device flow until it completes or
+// expires. It reuses handleWBPoll's logic by driving the same flow key.
+func (p *Panel) watchWBFlow(key string) {
+	deadline := time.Now().Add(flowMaxLifetime)
+	for time.Now().Before(deadline) {
+		time.Sleep(4 * time.Second)
+		f, ok := p.getFlow(key)
+		if !ok || f.status != "pending" {
+			return // completed, failed, or expired
+		}
+		p.wbAdvance(key, f)
+	}
+}
+
+// wbAdvance runs one token/account check for a pending flow, exactly like a
+// panel poll does, but without an HTTP response to write.
+func (p *Panel) wbAdvance(key string, f authFlow) {
+	if f.tok != nil {
+		p.finishWBAuth(nopWriter{}, key, f, *f.tok)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	base := p.wbRealmBase(f.realm)
+	origin := wbRealmOrigin(f.realm)
+	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(f.wbState), origin, nil, "", wbNoSentinels(true))
+	if err != nil {
+		return // pending or transient; the next round retries
+	}
+	var tok struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}
+	if json.Unmarshal(data, &tok) != nil || tok.AccessToken == "" {
+		return
+	}
+	parked := wbToken{access: tok.AccessToken, refresh: tok.RefreshToken, expiresIn: tok.ExpiresIn, domain: tok.Domain}
+	p.flowMu.Lock()
+	if live := p.flows[key]; live != nil {
+		live.tok = &parked
+	}
+	p.flowMu.Unlock()
+	p.finishWBAuth(nopWriter{}, key, f, parked)
+}
+
+// nopWriter discards the JSON a flow completion writes for the panel poll.
+type nopWriter struct{}
+
+func (nopWriter) Header() http.Header         { return http.Header{} }
+func (nopWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (nopWriter) WriteHeader(int)             {}
+
+func (p *Panel) handleWBPoll(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		State string `json:"state"`
+		Realm string `json:"realm"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.State == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "state required"})
+		return
+	}
+	key := "w:" + req.State
+	f, ok := p.getFlow(key)
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": "登录会话不存在或已过期，请重新发起"})
+		return
+	}
+	// An active poll keeps the flow alive (sliding TTL, BP-51).
+	p.touchFlow(key)
+	// 防混域: the poll must stay in the realm the flow was created with.
+	if req.Realm != "" && req.Realm != f.realm {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "realm mismatch: 与发起时的 realm 不一致"})
+		return
+	}
+	switch f.status {
+	case "success", "failed":
+		writeJSON(w, http.StatusOK, flowStatusJSON(f))
+		return
+	}
+
+	// A previous poll may already hold the single-issue token (e.g. its account
+	// lookup timed out). Finish with it rather than asking the token endpoint
+	// again — upstream answers 11217 forever once the token has been issued.
+	if f.tok != nil {
+		p.finishWBAuth(w, key, f, *f.tok)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	base := p.wbRealmBase(f.realm)
+	origin := wbRealmOrigin(f.realm)
+	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(req.State), origin, nil, "", wbNoSentinels(true))
+	if err != nil {
+		var biz *wbBizError
+		if isBizError(err, &biz) {
+			// Non-zero business code on the token endpoint means "login not
+			// finished yet" — keep waiting until the flow TTL.
+			writeJSON(w, http.StatusOK, map[string]any{"status": "pending"})
+			return
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "auth token: " + err.Error()})
+		return
+	}
+	var tok struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}
+	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "pending"})
+		return
+	}
+	// The device-flow token is issued ONCE: after this GET the upstream answers
+	// "11217 login ing..." forever, so a poll that fails between here and the
+	// account lookup used to lose the login outright (field report 2026-10-21:
+	// browser said 登录成功, the panel polled until 等待授权超时 and nothing was
+	// stored). Park the token on the flow first, then finish from it.
+	p.flowMu.Lock()
+	if live := p.flows[key]; live != nil {
+		live.tok = &wbToken{
+			access: tok.AccessToken, refresh: tok.RefreshToken,
+			expiresIn: tok.ExpiresIn, domain: tok.Domain,
+		}
+	}
+	p.flowMu.Unlock()
+	p.finishWBAuth(w, key, f, wbToken{
+		access: tok.AccessToken, refresh: tok.RefreshToken,
+		expiresIn: tok.ExpiresIn, domain: tok.Domain,
+	})
+}
+
+// finishWBAuth completes a WorkBuddy login with an already-issued token: it
+// fetches the account identity and stores the credential. The token may come
+// from this poll or from the flow (a previous poll that lost the identity
+// lookup) — the device-flow token cannot be fetched twice.
+func (p *Panel) finishWBAuth(w http.ResponseWriter, key string, f authFlow, tok wbToken) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	base := p.wbRealmBase(f.realm)
+	origin := wbRealmOrigin(f.realm)
+	var acct wbAccountInfo
+	// BP-225 (misakano 96b816da): login/account carries x-domain + Bearer +
+	// three x-no-* — no x-no-authorization (it has Bearer), and it is the
+	// endpoint where "uid not stored yet" is the point.
+	acctExtra := wbNoSentinels(false)
+	acctExtra["X-Domain"] = strings.TrimPrefix(origin, "https://")
+	if acctData, aerr := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/login/account?state="+url.QueryEscape(f.wbState), origin, nil, tok.access, acctExtra); aerr == nil {
+		acct = parseWBAccount(acctData)
+	}
+	if acct.UID == "" {
+		// uid is the stable identity and the token is already ours; keep the
+		// flow pending so the next poll retries the identity call with the
+		// parked token instead of throwing the login away.
+		writeJSON(w, http.StatusOK, map[string]any{"status": "pending"})
+		return
+	}
+	creds := map[string]any{
+		"access_token":  tok.access,
+		"refresh_token": tok.refresh,
+		"uid":           acct.UID,
+		"nickname":      acct.Nickname,
+		"realm":         f.realm,
+	}
+	if acct.EnterpriseID != "" {
+		creds["enterprise_id"] = acct.EnterpriseID
+	}
+	if tok.expiresIn > 0 {
+		creds["expires_at"] = time.Now().Add(time.Duration(tok.expiresIn) * time.Second).Unix()
+	}
+	raw, _ := json.Marshal(creds)
+	acc, err := normalizeImport(model.ChannelWorkBuddy, raw, "")
+	if err != nil {
+		p.finishFlow(key, "failed", "", "凭据组装失败")
+		writeJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": "凭据组装失败"})
+		return
+	}
+	if err := p.store.SaveAccount(acc); err != nil {
+		log.Printf("panel: workbuddy device login save failed: %v", err)
+		p.finishFlow(key, "failed", "", "保存账号失败")
+		writeJSON(w, http.StatusOK, map[string]any{"status": "failed", "error": "保存账号失败"})
+		return
+	}
+	p.gw.Pool().Upsert(acc)
+	p.finishFlow(key, "success", acc.ID, "")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "account_id": acc.ID})
+}
+
+func isBizError(err error, out **wbBizError) bool {
+	if be, ok := err.(*wbBizError); ok {
+		*out = be
+		return true
+	}
+	return false
+}
+
+// wbCall performs one device-flow request and unwraps the {code,msg,data}
+// envelope. Non-zero codes come back as *wbBizError.
+//
+// BP-225 (misakano 96b816da, 2026-10-30 dual-realm captures): the three
+// device-flow endpoints are plain node-fetch calls — they carry NO Origin,
+// NO Referer and NO X-Requested-With (those belong to the browser opening the
+// authorization page, a different step). Content-Type exists only on the one
+// POST (auth/state); the GETs are bodyless and the real client sends no
+// content type. The per-endpoint differences (x-domain, x-custom-channel-id,
+// x-no-* sentinels) arrive via extra.
+func (p *Panel) wbCall(ctx context.Context, method, fullURL, origin string, body []byte, bearer string, extra map[string]string) (json.RawMessage, error) {
+	var rd io.Reader
+	if body != nil {
+		rd = strings.NewReader(string(body))
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, rd)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", wbLoginUA(wbRealmOf(origin)))
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Request-ID", wbRandomHex32())
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	for k, v := range extra {
+		req.Header.Set(k, v)
+	}
+	resp, err := p.hc.Do(req)
+	if err != nil {
+		log.Printf("panel: workbuddy %s %s: transport: %v", method, fullURL, err)
+		return nil, fmt.Errorf("transport: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("panel: workbuddy %s %s: upstream %d body=%.120s", method, fullURL, resp.StatusCode, raw)
+		return nil, fmt.Errorf("upstream %d", resp.StatusCode)
+	}
+	if rerr != nil {
+		return nil, fmt.Errorf("read body: %w", rerr)
+	}
+	var env struct {
+		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode envelope")
+	}
+	if env.Code != 0 {
+		log.Printf("panel: workbuddy %s %s: upstream code=%d msg=%s", method, fullURL, env.Code, env.Msg)
+		return nil, &wbBizError{code: env.Code, msg: env.Msg}
+	}
+	log.Printf("panel: workbuddy %s %s: ok", method, fullURL)
+	return env.Data, nil
+}
+
+// wbAccountInfo is the identity the device flow returns for the logged-in
+// account.
+type wbAccountInfo struct {
+	UID          string
+	EnterpriseID string
+	Nickname     string
+}
+
+// parseWBAccount accepts both account-endpoint shapes the upstream serves:
+//
+//	flat:    {"uid":"…","nickname":"…","enterpriseId":"…"}
+//	list:    {"accounts":[{"uid":"…","nickname":"…","lastLogin":true,…}, …]}
+//
+// The list shape appeared on the international edge (field capture
+// 2026-10-22, uid c71ff2d7…): the flat decoder read nothing, so the panel
+// polled forever. The list picks the account flagged lastLogin, else the
+// first one. The flat shape stays supported (it is what the CN edge returns).
+func parseWBAccount(data json.RawMessage) wbAccountInfo {
+	var flat struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	}
+	_ = json.Unmarshal(data, &flat)
+	if flat.UID != "" {
+		return wbAccountInfo{UID: flat.UID, EnterpriseID: flat.EnterpriseID, Nickname: flat.Nickname}
+	}
+	var list struct {
+		Accounts []struct {
+			UID          string `json:"uid"`
+			EnterpriseID string `json:"enterpriseId"`
+			Nickname     string `json:"nickname"`
+			LastLogin    bool   `json:"lastLogin"`
+		} `json:"accounts"`
+	}
+	_ = json.Unmarshal(data, &list)
+	for _, a := range list.Accounts {
+		if a.LastLogin && a.UID != "" {
+			return wbAccountInfo{UID: a.UID, EnterpriseID: a.EnterpriseID, Nickname: a.Nickname}
+		}
+	}
+	for _, a := range list.Accounts {
+		if a.UID != "" {
+			return wbAccountInfo{UID: a.UID, EnterpriseID: a.EnterpriseID, Nickname: a.Nickname}
+		}
+	}
+	return wbAccountInfo{}
+}

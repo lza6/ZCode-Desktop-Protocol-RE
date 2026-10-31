@@ -1,0 +1,20 @@
+node_modules/
+*.log
+config.yaml
+.omo/evidence/
+dist/
+.DS_Store
+*.tsbuildinfo
+/.omo
+/_reverse
+/zcode-proxy.exe
+/zcode-proxy-linux-*
+/zcode-proxy-darwin-*
+.idea/
+
+# Android build artifacts
+Android-APP/app/build/
+Android-APP/.gradle/
+Android-APP/.kotlin/
+Android-APP/local.properties
+Android-APP/gradlew.bat

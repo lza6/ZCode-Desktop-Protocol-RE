@@ -1,0 +1,1 @@
+import{n as e,t}from"./alarm-clock-B0ZFLNxu.js";export{e as __iconNode,t as default};

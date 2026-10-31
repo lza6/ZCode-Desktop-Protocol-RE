@@ -1,0 +1,19 @@
+# Go 构建产物
+*.exe
+*.exe~
+
+# 运行时产物
+*.log
+request.log
+logs/
+dumps/
+__pycache__/
+
+# 凭据（token/凭据文件，不入库）
+token.json
+credentials.json
+.env
+.env.*
+
+tools/node_modules/
+exp/

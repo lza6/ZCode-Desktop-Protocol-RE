@@ -1,0 +1,207 @@
+{
+ "billing/balance": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @586447",
+  "app/resources/extracted/out/host/index.js @1176566",
+  "app/resources/extracted/out/host/index.js @1176846",
+  "app/resources/extracted/out/host/index.js @1284279",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @475255",
+  "app/resources/extracted/out/renderer/assets/validation-Bm1aanb4.js @126258",
+  "app/resources/extracted/out/scheduler/index.js @506857",
+  "app/resources/glm/zcode.cjs @673654"
+ ],
+ "billing/current": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @586379",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @475187",
+  "app/resources/extracted/out/renderer/assets/validation-Bm1aanb4.js @126190",
+  "app/resources/extracted/out/scheduler/index.js @506789",
+  "app/resources/glm/zcode.cjs @673586"
+ ],
+ "Aliyun-Captcha": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @614555",
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @614628",
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @614730",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2472570",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2472606",
+  "app/resources/glm/zcode.cjs @807458",
+  "app/resources/glm/zcode.cjs @807531",
+  "app/resources/glm/zcode.cjs @808667"
+ ],
+ "Z Code@": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @793860",
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @794364",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @793516",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @794020",
+  "app/resources/glm/zcode.cjs @968850",
+  "app/resources/glm/zcode.cjs @969257",
+  "app/resources/glm/zcode.cjs @14423056"
+ ],
+ "api.z.ai": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @582670",
+  "app/resources/extracted/out/host/index.js @1089964",
+  "app/resources/extracted/out/host/index.js @1101660",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @471206",
+  "app/resources/extracted/out/main/index.js @534838",
+  "app/resources/extracted/out/main/index.js @728465",
+  "app/resources/extracted/out/scheduler/index.js @503843",
+  "app/resources/glm/zcode.cjs @674199",
+  "app/resources/glm/zcode.cjs @4430178"
+ ],
+ "chat.z.ai": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @582612",
+  "app/resources/extracted/out/host/index.js @1089807",
+  "app/resources/extracted/out/host/index.js @1089908",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @471148",
+  "app/resources/glm/zcode.cjs @674139"
+ ],
+ "zcode.z.ai": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @582498",
+  "app/resources/extracted/out/host/index.js @1089115",
+  "app/resources/extracted/out/host/index.js @1089856",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @800",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @471011",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @827058",
+  "app/resources/extracted/out/main/chunk-HH7N2YVI.js @1145",
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @146022",
+  "app/resources/extracted/out/main/index.js @36826",
+  "app/resources/extracted/out/preload/codingPlanWebview.cjs @496905",
+  "app/resources/extracted/out/preload/rewardsWebview.cjs @745905",
+  "app/resources/extracted/out/renderer/assets/index-BKc65Hik.js @8901",
+  "app/resources/extracted/out/renderer/assets/index-BKc65Hik.js @8980",
+  "app/resources/extracted/out/renderer/assets/index-BKc65Hik.js @24589",
+  "app/resources/extracted/out/renderer/assets/IntlProvider-Bw7hoRlp.js @24310",
+  "app/resources/extracted/out/renderer/assets/IntlProvider-Bw7hoRlp.js @353462",
+  "app/resources/extracted/out/renderer/assets/IntlProvider-Bw7hoRlp.js @387300",
+  "app/resources/extracted/out/renderer/assets/logger-C_hhhQlG.js @207",
+  "app/resources/extracted/out/renderer/assets/logger-C_hhhQlG.js @286",
+  "app/resources/extracted/out/renderer/assets/src-BINylioZ.js @57267",
+  "app/resources/extracted/out/renderer/assets/src-BINylioZ.js @57734",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @1760663",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2292540",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2292619",
+  "app/resources/extracted/out/renderer/assets/subagentsStore-BF3iXtI0.js @449",
+  "app/resources/extracted/out/renderer/assets/subagentsStore-BF3iXtI0.js @528",
+  "app/resources/extracted/out/renderer/assets/validation-Bm1aanb4.js @123609",
+  "app/resources/extracted/out/renderer/assets/validation-Bm1aanb4.js @124633",
+  "app/resources/extracted/out/scheduler/index.js @503725",
+  "app/resources/extracted/out/scheduler/index.js @989663",
+  "app/resources/glm/zcode.cjs @523939",
+  "app/resources/glm/zcode.cjs @673997",
+  "app/resources/glm/zcode.cjs @674323"
+ ],
+ "device_mid": [
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @607581",
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @827410",
+  "app/resources/extracted/out/host/chunk-5YNPFY3L.js @827549",
+  "app/resources/extracted/out/host/index.js @1511683",
+  "app/resources/extracted/out/host/index.js @1511707",
+  "app/resources/extracted/out/host/index.js @1515054",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @524030",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @815620",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @815759",
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @51239",
+  "app/resources/extracted/out/main/index.js @45829",
+  "app/resources/extracted/out/main/index.js @47758",
+  "app/resources/extracted/out/main/index.js @53419",
+  "app/resources/extracted/out/preload/codingPlanWebview.cjs @519361",
+  "app/resources/extracted/out/preload/codingPlanWebview.cjs @749295",
+  "app/resources/extracted/out/preload/codingPlanWebview.cjs @749434",
+  "app/resources/extracted/out/preload/cuaPermissionPanel.cjs @518975",
+  "app/resources/extracted/out/preload/cuaPermissionPanel.cjs @748844",
+  "app/resources/extracted/out/preload/cuaPermissionPanel.cjs @748983",
+  "app/resources/extracted/out/preload/embeddedBrowserJavaScriptDialog.cjs @518975",
+  "app/resources/extracted/out/preload/embeddedBrowserJavaScriptDialog.cjs @748904",
+  "app/resources/extracted/out/preload/embeddedBrowserJavaScriptDialog.cjs @749043",
+  "app/resources/extracted/out/preload/index.cjs @519036",
+  "app/resources/extracted/out/preload/index.cjs @750029",
+  "app/resources/extracted/out/preload/index.cjs @750168",
+  "app/resources/extracted/out/preload/pluginSandbox.cjs @518975",
+  "app/resources/extracted/out/preload/pluginSandbox.cjs @740319",
+  "app/resources/extracted/out/preload/pluginSandbox.cjs @740458",
+  "app/resources/extracted/out/preload/resourceManager.cjs @518975",
+  "app/resources/extracted/out/preload/resourceManager.cjs @749428",
+  "app/resources/extracted/out/preload/resourceManager.cjs @749567",
+  "app/resources/extracted/out/preload/rewardsWebview.cjs @518975",
+  "app/resources/extracted/out/preload/rewardsWebview.cjs @740277",
+  "app/resources/extracted/out/preload/rewardsWebview.cjs @740416",
+  "app/resources/extracted/out/renderer/assets/src-BINylioZ.js @50621",
+  "app/resources/extracted/out/renderer/assets/src-BINylioZ.js @50697",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2398048",
+  "app/resources/extracted/out/renderer/assets/validation-Bm1aanb4.js @146516",
+  "app/resources/extracted/out/scheduler/index.js @528107",
+  "app/resources/extracted/out/scheduler/index.js @759909",
+  "app/resources/extracted/out/scheduler/index.js @760048",
+  "app/resources/glm/zcode.cjs @701389",
+  "app/resources/glm/zcode.cjs @1050760",
+  "app/resources/glm/zcode.cjs @1050904"
+ ],
+ "zcodejwttoken": [
+  "app/resources/extracted/out/host/index.js @1092275",
+  "app/resources/extracted/out/host/index.js @1104603",
+  "app/resources/extracted/out/host/index.js @1110951",
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @146375",
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @157398",
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @259951",
+  "app/resources/extracted/out/preload/rewardsWebview.cjs @746338",
+  "app/resources/extracted/out/renderer/assets/src-BINylioZ.js @58033",
+  "app/resources/extracted/out/renderer/assets/src-BINylioZ.js @58241",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2293629",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2394725",
+  "app/resources/extracted/out/renderer/assets/styles-CQuzX8si.js @2396226",
+  "app/resources/extracted/out/scheduler/index.js @994782",
+  "app/resources/glm/zcode.cjs @1071996",
+  "app/resources/glm/zcode.cjs @1073055",
+  "app/resources/glm/zcode.cjs @1073263"
+ ],
+ "oauth/cli/init": [
+  "app/resources/extracted/out/host/index.js @1120639",
+  "app/resources/glm/zcode.cjs @4430654"
+ ],
+ "oauth/token": [
+  "app/resources/extracted/out/host/index.js @1089133",
+  "app/resources/extracted/out/host/index.js @1089438",
+  "app/resources/extracted/out/host/index.js @1089874",
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @146040",
+  "app/resources/extracted/out/scheduler/index.js @989681"
+ ],
+ "z/login": [
+  "app/resources/extracted/out/host/index.js @1089982",
+  "app/resources/extracted/out/host/index.js @1090364",
+  "app/resources/extracted/out/host/index.js @1101678",
+  "app/resources/glm/zcode.cjs @4428534"
+ ],
+ "billing/claim": [
+  "app/resources/extracted/out/host/index.js @1153457"
+ ],
+ "client/configs": [
+  "app/resources/extracted/out/host/index.js @114293",
+  "app/resources/extracted/out/host/index.js @1150825",
+  "app/resources/extracted/out/host/index.js @1310588",
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @803231",
+  "app/resources/extracted/out/main/index.js @60077",
+  "app/resources/extracted/out/main/index.js @569401",
+  "app/resources/glm/zcode.cjs @609143",
+  "app/resources/glm/zcode.cjs @1004542"
+ ],
+ "open.bigmodel.cn": [
+  "app/resources/extracted/out/host/index.js @1716252",
+  "app/resources/extracted/out/renderer/assets/IntlProvider-Bw7hoRlp.js @156263"
+ ],
+ "event/report": [
+  "app/resources/extracted/out/main/chunk-CJROBAMZ.js @818"
+ ],
+ "app_launch": [
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @52965"
+ ],
+ "app_daily_active": [
+  "app/resources/extracted/out/main/chunk-XIAUSX7W.js @53407"
+ ],
+ "agent/configs": [
+  "app/resources/glm/zcode.cjs @4203434"
+ ],
+ "x-device-mid": [
+  "app/resources/glm/zcode.cjs @4199252"
+ ],
+ "paas/c1f3a7e2": [
+  "app/resources/glm/zcode.cjs @3823640"
+ ]
+}
